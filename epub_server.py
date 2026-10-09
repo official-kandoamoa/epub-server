@@ -31,6 +31,7 @@ Usage:
 import argparse
 import hashlib
 import html
+import html.entities as html_entities
 import mimetypes
 import posixpath
 import re
@@ -118,12 +119,12 @@ class DirSource:
     def read(self, name):
         last_exc = None
         for candidate in self._candidates(name):
-            p = (self._root / candidate).resolve()
-            if self._root != p and self._root not in p.parents:
-                continue
             try:
+                p = (self._root / candidate).resolve()
+                if self._root != p and self._root not in p.parents:
+                    continue  # path escaped the root - never follow it
                 return p.read_bytes()
-            except OSError as exc:
+            except (OSError, ValueError) as exc:  # ValueError: e.g. NUL byte in a crafted URL
                 last_exc = exc
         raise FileNotFoundError(name) from last_exc
 
@@ -351,7 +352,7 @@ class Book:
             t = nav.get(f'{{{EPUB_OPS_NS_URI}}}type', '') or nav.get('type', '')
             if 'toc' in t.split(): toc_nav = nav; break
         navs = _find_descendants(root, 'nav', XHTML_NS_URI)
-        toc_nav = toc_nav or (navs[0] if navs else None)
+        if toc_nav is None and navs: toc_nav = navs[0]  # no epub:type="toc" found - best guess
         ol = _find_child(toc_nav, 'ol', XHTML_NS_URI) if toc_nav is not None else None
         return self._parse_nav_ol(ol, base_dir) if ol is not None else []
 
@@ -359,7 +360,8 @@ class Book:
         entries = []
         for li in _find_children(ol, 'li', XHTML_NS_URI):
             a = _find_child(li, 'a', XHTML_NS_URI)
-            label = a or _find_child(li, 'span', XHTML_NS_URI)
+            # `a or ...` would be a bug: an Element with no child tags is falsy, so a plain <a>text</a> was skipped.
+            label = a if a is not None else _find_child(li, 'span', XHTML_NS_URI)
             title = ' '.join(''.join(label.itertext()).split()) if label is not None else ''
             path = frag = ''
             if a is not None and a.get('href') and not a.get('href').startswith(('http://', 'https://', 'mailto:')):
@@ -411,8 +413,8 @@ def make_link(path, fragment=''):
 
 def make_nav_bar(book, current_path):
     idx = book.spine.index(current_path) if current_path in book.spine else -1
-    prev = f'<a href="{make_link(book.spine[idx-1])}">&larr; Prev</a>' if idx > 0 else ''
-    nxt = f'<a href="{make_link(book.spine[idx+1])}">Next &rarr;</a>' if 0 <= idx < len(book.spine)-1 else ''
+    prev = f'<a href="{make_link(book.spine[idx-1])}">&#8592; Prev</a>' if idx > 0 else ''
+    nxt = f'<a href="{make_link(book.spine[idx+1])}">Next &#8594;</a>' if 0 <= idx < len(book.spine)-1 else ''
     title = html.escape(book.titles.get(current_path, ''))
     pos = f'{idx+1} / {len(book.spine)}' if idx >= 0 else ''
     middle = f'<span class="mid"><span class="ch" title="{title}">{title}</span><span class="pos">{pos}</span></span>' if title or pos else ''
@@ -444,18 +446,87 @@ def make_index_html(book):
     return f'<!DOCTYPE html><html{direction}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{html.escape(book.title)}</title><style>{INDEX_CSS}</style></head><body>{cover}<h1>{html.escape(book.title)}</h1>{author}{drm}{toc}</body></html>'
 
 
+_XML_ONLY_ENTITIES = {'lt', 'gt', 'amp', 'quot', 'apos'}
+_ENTITY_REF_RE = re.compile(r'&([A-Za-z][A-Za-z0-9]*);')
+_COMMENT_OR_CDATA_RE = re.compile(r'<!--.*?-->|<!\[CDATA\[.*?\]\]>', re.DOTALL)
+
+
+def numeric_entities(text):
+    """Rewrite named HTML entities (&nbsp;, &eacute;, &mdash; ...) as numeric
+    character references (&#160; ...).
+
+    Named entities are only legal in XML when a DTD defines them, and XML
+    parsers (expat, and the browser's) only honour the XHTML set when the
+    document carries a matching DOCTYPE - plenty of books use &nbsp; under an
+    HTML5 doctype or none at all. Numeric references are valid everywhere.
+    Comments and CDATA sections are left alone: there, "&nbsp;" is literal
+    text (e.g. a code sample) and must stay exactly as written."""
+    def repl(m):
+        name = m.group(1)
+        if name in _XML_ONLY_ENTITIES: return m.group(0)
+        codepoint = html_entities.name2codepoint.get(name)
+        return f'&#{codepoint};' if codepoint is not None else m.group(0)
+
+    out, pos = [], 0
+    for m in _COMMENT_OR_CDATA_RE.finditer(text):
+        out.append(_ENTITY_REF_RE.sub(repl, text[pos:m.start()])); out.append(m.group(0)); pos = m.end()
+    out.append(_ENTITY_REF_RE.sub(repl, text[pos:]))
+    return ''.join(out)
+
+
+def is_wellformed_xhtml(text):
+    """True if `text` parses as XML *and* its root is an XHTML <html>.
+
+    EPUB content documents are XHTML, i.e. XML. Served as text/html a browser
+    uses its HTML parser instead, which mishandles perfectly valid XHTML:
+    self-closing non-void tags like <a id="page_12"/> or <span/> are treated
+    as *open* tags, so everything after them ends up nested inside (an empty
+    page-anchor <a/> turns the rest of the chapter into one giant link). Real
+    readers parse these as XML. Run numeric_entities() first so named HTML
+    entities don't cause a false "not well-formed"."""
+    parser = ET.XMLParser()
+    try:
+        parser.feed(text.encode('utf-8')); root = parser.close()
+    except (ET.ParseError, ValueError):
+        return False
+    return root.tag == f'{{{XHTML_NS_URI}}}html'
+
+
 class ReaderHandler(BaseHTTPRequestHandler):
     book = None
-    def log_message(self, fmt, *args): pass
+    verbose = False
+    _head_only = False
+    def log_message(self, fmt, *args): pass  # all request logging goes through log_request below
+    def log_request(self, code='-', size='-'):
+        # Always surface failures (a 404 for a stylesheet or font is the usual
+        # reason a book looks wrong); log every request with --verbose.
+        try: failed = int(code) >= 400
+        except (TypeError, ValueError): failed = False
+        if self.verbose or failed: print(f'{code} {self.command} {self.path}', file=sys.stderr)
     def do_GET(self):
         try: self._route()
         except Exception as exc:
             traceback.print_exc(); self._send(500, f'Internal error: {exc}'.encode('utf-8', 'replace'), 'text/plain; charset=utf-8')
+    def do_HEAD(self):  # same status and headers as GET, no body
+        self._head_only = True; self.do_GET()
     def _route(self):
         path = self.path.split('?', 1)[0]
         if path == '/': self._send(200, make_index_html(self.book).encode(), 'text/html; charset=utf-8')
         elif path.startswith('/book/'): self._serve_epub_file(self.book.resolve(path[6:]))
-        else: self._send(404, b'Not found', 'text/plain; charset=utf-8')
+        else:
+            # Some books reference resources by a root-absolute URL such as href="/styles/main.css"
+            # or src="/OEBPS/images/a.png", meaning "from the root of the book". Serve those too,
+            # trying the epub root first, then the package folder.
+            rel = self.book.resolve(path)
+            candidates = [rel] + ([posixpath.normpath(posixpath.join(self.book.opf_dir, rel))] if self.book.opf_dir else [])
+            found = None
+            for candidate in candidates:
+                try: self.book.read_resource(candidate)
+                except (KeyError, FileNotFoundError): continue
+                except DrmProtectedError: pass  # it exists; _serve_epub_file will send the DRM notice
+                found = candidate; break
+            if found is None: self._send(404, b'Not found', 'text/plain; charset=utf-8')
+            else: self._serve_epub_file(found)
     def _serve_epub_file(self, epub_path):
         try: raw = self.book.read_resource(epub_path)
         except DrmProtectedError:
@@ -467,12 +538,18 @@ class ReaderHandler(BaseHTTPRequestHandler):
             text, nav = XML_DECL_RE.sub('', sniff_text(raw)), make_nav_bar(self.book, epub_path)
             body = first_real_match(BODY_OPEN_RE, text)
             text = f'{text[:body.end()]}{nav}{text[body.end():]}' if body else nav + text
-            self._send(200, text.encode(), 'text/html; charset=utf-8')
+            # Well-formed XHTML is served as XML so the browser parses it the way the author
+            # intended; anything sloppy falls back to the forgiving HTML parser rather than
+            # showing an XML error page.
+            xml_text = numeric_entities(text)
+            if is_wellformed_xhtml(xml_text): self._send(200, xml_text.encode(), 'application/xhtml+xml; charset=utf-8')
+            else: self._send(200, text.encode(), 'text/html; charset=utf-8')
         elif lower.endswith('.css'): self._send(200, sniff_text(raw).encode(), 'text/css; charset=utf-8')
         else:
             ctype, _ = mimetypes.guess_type(lower); self._send(200, raw, ctype or 'application/octet-stream')
     def _send(self, status, body, ctype):
-        self.send_response(status); self.send_header('Content-Type', ctype); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+        self.send_response(status); self.send_header('Content-Type', ctype); self.send_header('Content-Length', str(len(body))); self.end_headers()
+        if not self._head_only: self.wfile.write(body)
 
 
 def main():
@@ -480,6 +557,7 @@ def main():
     parser.add_argument('epub', help='.epub file, or a folder of already-extracted contents')
     parser.add_argument('--port', type=int, default=8000); parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--no-browser', action='store_true', help="don't try to auto-open a browser tab")
+    parser.add_argument('--verbose', action='store_true', help='log every request (failed requests are always logged)')
     args = parser.parse_args(); src_path = Path(args.epub)
     if not src_path.exists(): sys.exit(f'error: {src_path} not found')
     try: book = Book(open_source(src_path))
@@ -489,7 +567,10 @@ def main():
     if book.toc: print(f'table of contents: {len(book.toc)} top-level entries')
     if book.obfuscated_fonts: print(f'{len(book.obfuscated_fonts)} obfuscated font(s) will be de-obfuscated on the fly')
     if book.has_drm: print(f'warning: {len(book.drm_paths)} resource(s) are DRM-protected and will not be viewable')
-    ReaderHandler.book = book; server = ThreadingHTTPServer((args.host, args.port), ReaderHandler)
+    ReaderHandler.book = book; ReaderHandler.verbose = args.verbose
+    try: server = ThreadingHTTPServer((args.host, args.port), ReaderHandler)
+    except OSError as exc:
+        sys.exit(f'error: could not listen on {args.host}:{args.port} ({exc.strerror or exc}). Is another copy already running? Try a different --port.')
     url = f'http://{args.host}:{args.port}/'; print(f'serving at {url}  (Ctrl+C to stop)')
     if not args.no_browser:
         try: threading.Timer(0.5, lambda: webbrowser.open(url)).start()

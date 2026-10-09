@@ -15,6 +15,17 @@ local website, so you can read it in any browser.
 - **Handles messy real-world zips** — percent-encoded filenames, filenames
   with a different Unicode normalization than the metadata expects (NFC vs
   NFD, common from macOS), and legacy CP437-mangled filenames.
+- **Renders XHTML the way the author intended** — well-formed chapters are
+  served as real XHTML (`application/xhtml+xml`), not forced through the
+  browser's HTML parser. That matters because HTML parsing treats a
+  self-closing tag like `<a id="page_12"/>` as an *open* tag, which turns the
+  rest of the chapter into one giant link. Named entities (`&nbsp;`,
+  `&mdash;`, ...) work under any doctype. Sloppy, non-well-formed chapters
+  automatically fall back to the forgiving HTML parser instead of showing an
+  XML error page.
+- **Root-absolute links work** — references like `href="/styles/main.css"`
+  or `src="/OEBPS/images/a.png"` are resolved against the book (package folder
+  first, then the epub root) instead of 404ing.
 - **Won't be fooled by embedded examples** — a literal `<body>`, `<title>`,
   or `<h1>` shown as example markup inside a comment, CDATA section, or a
   `<script>`/`<style>` block (common in programming and web-dev books) is
@@ -55,6 +66,7 @@ This starts a local server and opens your browser to it automatically.
 | `--port PORT`  | `8000`        | Port to serve on                                          |
 | `--host HOST`  | `127.0.0.1`   | Host/interface to bind to                                  |
 | `--no-browser` | off           | Don't automatically open a browser tab                    |
+| `--verbose`    | off           | Log every request (failed requests are always logged)     |
 
 ### Examples
 
@@ -87,6 +99,15 @@ python epub_server.py my-book.epub --host 0.0.0.0
 
 Stop the server with `Ctrl+C`.
 
+### Troubleshooting
+
+- **A book looks unstyled or has missing images/fonts** — watch the terminal.
+  Every failed request is printed (e.g. `404 GET /book/OEBPS/styles/x.css`),
+  which usually points straight at the broken reference inside the book. Use
+  `--verbose` to see every request.
+- **"Address already in use"** — another copy (or another program) is on that
+  port. Pick a different one with `--port`.
+
 ## How it works
 
 1. Reads the epub's `META-INF/container.xml` to find the OPF package file,
@@ -103,11 +124,13 @@ Stop the server with `Ctrl+C`.
    IDPF or Adobe schemes are de-obfuscated on the fly and served normally.
    Anything else listed there is treated as genuine DRM: those pages
    return a clear "DRM-protected" message instead of content.
-5. Serves each chapter as HTML with a small reading nav bar injected right
-   after the chapter's real `<body>` tag (again skipping past any comments,
-   CDATA, or script/style blocks that might contain tag-looking example
-   text), and serves the book's CSS, images, and fonts as their own files
-   so original styling works.
+5. Serves each chapter with a small reading nav bar injected right after the
+   chapter's real `<body>` tag (again skipping past any comments, CDATA, or
+   script/style blocks that might contain tag-looking example text). Named
+   HTML entities are first rewritten as numeric references; if the result
+   parses as well-formed XHTML it's sent as `application/xhtml+xml`,
+   otherwise as `text/html`. The book's CSS, images, and fonts are served as
+   their own files so original styling works.
 
 ## What it can't do
 
