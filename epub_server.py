@@ -145,8 +145,11 @@ def open_source(path):
 
 def sniff_text(raw):
     """Decode text while honoring declared encodings, with safe fallbacks."""
+    # The 'utf-16' codec reads the BOM to pick the byte order *and* consumes it; 'utf-16-le'/'-be'
+    # would leave a U+FEFF at the start of the text, which stops the leading <?xml ...?>
+    # declaration from being recognised and stripped (so the chapter fell back to HTML mode).
     for bom, enc in ((b'\xef\xbb\xbf', 'utf-8-sig'),
-                      (b'\xff\xfe', 'utf-16-le'), (b'\xfe\xff', 'utf-16-be')):
+                      (b'\xff\xfe', 'utf-16'), (b'\xfe\xff', 'utf-16')):
         if raw.startswith(bom):
             return raw.decode(enc, errors='replace')
     head = raw[:1024].decode('ascii', errors='ignore')
