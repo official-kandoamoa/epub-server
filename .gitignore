@@ -1,0 +1,37 @@
+# EPUB files: keep books you open while testing out of the repo
+# (they are usually copyrighted). To track a deliberate test fixture, add a
+# negation such as: !tests/fixtures/sample.epub
+*.epub
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local config
+.venv/
+venv/
+env/
+.env
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Editors and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
