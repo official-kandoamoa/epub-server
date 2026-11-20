@@ -22,10 +22,17 @@ Aims to support "all kinds" of epub in the wild, not just tidy ones:
 
 Works on a raw .epub file, or a folder you already extracted one into.
 
+It can also host PDFs: point it at a single .pdf, or at a folder of PDFs (searched
+recursively) and it serves a library page plus an in-browser viewer. PDFs are
+streamed straight from disk with HTTP Range support, so big files open quickly
+and the browser can jump around in them without downloading everything first.
+
 Usage:
     python epub_server.py book.epub
     python epub_server.py book.epub --port 9000
     python epub_server.py ./already-extracted-folder
+    python epub_server.py paper.pdf
+    python epub_server.py ./folder-of-pdfs
 """
 
 import argparse
@@ -33,6 +40,7 @@ import hashlib
 import html
 import html.entities as html_entities
 import mimetypes
+import os
 import posixpath
 import re
 import sys
@@ -555,14 +563,234 @@ class ReaderHandler(BaseHTTPRequestHandler):
         if not self._head_only: self.wfile.write(body)
 
 
+# ---------------------------------------------------------------------------
+# PDF hosting
+# ---------------------------------------------------------------------------
+
+PDF_MAGIC = b'%PDF-'
+PDF_CHUNK = 64 * 1024
+PDF_URL_RE = re.compile(r'/(view|pdf|dl)/([0-9a-f]{12})')
+
+PDF_CSS = ('body{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px}li{margin:8px 0}'
+           '.meta{color:#666;font-size:.85em;margin-left:6px}.dl{font-size:.85em;margin-left:10px}'
+           'body.viewer{max-width:none;margin:0;padding:0;height:100vh;display:flex;flex-direction:column}'
+           '#bar{background:#222;color:#eee;font-size:14px;padding:8px 14px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}'
+           '#bar a{color:#9cf;text-decoration:none;white-space:nowrap}#bar a:hover{text-decoration:underline}'
+           '#bar .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:0 1 auto}#bar .sp{flex:1 1 auto}'
+           'object{flex:1 1 auto;width:100%;border:0}object p{padding:16px}')
+
+
+def is_pdf_file(path):
+    """True for a file that is a PDF by extension or by its magic bytes."""
+    path = Path(path)
+    if not path.is_file():
+        return False
+    if path.suffix.lower() == '.pdf':
+        return True
+    try:
+        with open(path, 'rb') as f:
+            return f.read(len(PDF_MAGIC)) == PDF_MAGIC
+    except OSError:
+        return False
+
+
+@dataclass
+class PdfEntry:
+    id: str
+    path: Path
+    name: str  # path relative to the library root, '/'-separated, shown in the list
+    title: str
+    size: int
+
+
+class PdfLibrary:
+    """A single PDF, or every PDF found (recursively) under a folder.
+
+    The folder is rescanned on every request, so PDFs dropped in while the
+    server is running show up on a page reload. Files are addressed by an id
+    derived from their relative path - never by a path taken from the URL - so
+    a request can only ever reach a file the scan found."""
+
+    def __init__(self, path):
+        self.root = Path(path).resolve()
+        self.single = self.root.is_file()
+
+    def scan(self):
+        if self.single:
+            found, base = [self.root], self.root.parent
+        else:
+            found, base = [], self.root
+            for dirpath, dirnames, filenames in os.walk(self.root):
+                dirnames[:] = sorted(d for d in dirnames if not d.startswith('.'))
+                found.extend(Path(dirpath, f) for f in sorted(filenames)
+                             if f.lower().endswith('.pdf') and not f.startswith('.'))
+            found.sort(key=lambda p: str(p.relative_to(base)).lower())
+        entries = []
+        for p in found:
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            rel = p.relative_to(base).as_posix()
+            entry_id = hashlib.sha1(rel.encode('utf-8', 'surrogateescape')).hexdigest()[:12]
+            entries.append(PdfEntry(entry_id, p, rel, p.stem, size))
+        return entries
+
+
+def human_size(n):
+    size = float(n)
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if size < 1024 or unit == 'GB':
+            return f'{int(size)} {unit}' if unit == 'B' else f'{size:.1f} {unit}'
+        size /= 1024
+
+
+def parse_byte_range(header, size):
+    """Interpret a Range header for a file of `size` bytes.
+
+    Returns (start, end) inclusive for a satisfiable single range, None when the
+    header should be ignored (absent, malformed, multi-range - the whole file is
+    sent instead, which the HTTP spec allows), or False when it can't be satisfied."""
+    m = re.fullmatch(r'\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*', header or '')
+    if not m:
+        return None
+    first, last = m.groups()
+    if not first and not last:
+        return None
+    if not first:  # suffix range: the last N bytes
+        n = int(last)
+        if n == 0 or size == 0:
+            return False
+        return max(size - n, 0), size - 1
+    start = int(first)
+    if start >= size:
+        return False
+    end = size - 1 if not last else min(int(last), size - 1)
+    return None if end < start else (start, end)
+
+
+def content_disposition(kind, filename):
+    ascii_name = re.sub(r'[^\x20-\x7e]|["\\]', '_', filename)
+    return f'{kind}; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(filename, safe="", errors="replace")}'
+
+
+def make_pdf_library_html(entries):
+    if entries:
+        items = ''.join(
+            f'<li><a href="/view/{e.id}">{html.escape(e.name)}</a><span class="meta">{human_size(e.size)}</span>'
+            f'<a class="dl" href="/dl/{e.id}">download</a></li>' for e in entries)
+        body = f'<ol>{items}</ol>'
+    else:
+        body = '<p>No PDF files found.</p>'
+    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+            f'<title>PDF library</title><style>{PDF_CSS}</style></head><body><h1>PDF library</h1>{body}</body></html>')
+
+
+def make_pdf_viewer_html(entry, show_back):
+    title = html.escape(entry.title)
+    back = '<a href="/">&#8962; Library</a>' if show_back else ''
+    src, dl = f'/pdf/{entry.id}', f'/dl/{entry.id}'
+    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+            f'<title>{title}</title><style>{PDF_CSS}</style></head><body class="viewer">'
+            f'<div id="bar">{back}<span class="t" title="{title}">{title}</span><span class="sp"></span>'
+            f'<a href="{src}" target="_blank">Open in new tab</a><a href="{dl}">Download</a></div>'
+            f'<object data="{src}" type="application/pdf"><p>Your browser can\'t show PDFs inline. '
+            f'<a href="{src}">Open it</a> or <a href="{dl}">download it</a>.</p></object></body></html>')
+
+
+class PdfHandler(ReaderHandler):
+    library = None
+
+    def _route(self):
+        path = unquote(self.path.split('?', 1)[0])
+        entries = self.library.scan()
+        if path == '/':
+            if self.library.single and entries:
+                self._send(200, make_pdf_viewer_html(entries[0], show_back=False).encode(), 'text/html; charset=utf-8')
+            else:
+                self._send(200, make_pdf_library_html(entries).encode(), 'text/html; charset=utf-8')
+            return
+        m = PDF_URL_RE.fullmatch(path)
+        entry = next((e for e in entries if m and e.id == m.group(2)), None)
+        if entry is None:
+            self._send(404, b'Not found', 'text/plain; charset=utf-8')
+        elif m.group(1) == 'view':
+            self._send(200, make_pdf_viewer_html(entry, show_back=not self.library.single).encode(), 'text/html; charset=utf-8')
+        else:
+            self._send_pdf(entry, 'attachment' if m.group(1) == 'dl' else 'inline')
+
+    def _send_pdf(self, entry, disposition):
+        try:
+            f = open(entry.path, 'rb')
+        except OSError:
+            self._send(404, b'That PDF is no longer available', 'text/plain; charset=utf-8')
+            return
+        with f:
+            size = os.fstat(f.fileno()).st_size
+            byte_range = parse_byte_range(self.headers.get('Range'), size)
+            if byte_range is False:
+                self.send_response(416); self.send_header('Content-Range', f'bytes */{size}')
+                self.send_header('Content-Length', '0'); self.end_headers()
+                return
+            start, end = byte_range if byte_range else (0, size - 1)
+            length = max(end - start + 1, 0)
+            self.send_response(206 if byte_range else 200)
+            self.send_header('Content-Type', 'application/pdf')
+            self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Content-Length', str(length))
+            self.send_header('Content-Disposition', content_disposition(disposition, entry.path.name))
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            if byte_range: self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+            self.end_headers()
+            if self._head_only:
+                return
+            f.seek(start)
+            remaining = length
+            try:
+                while remaining > 0:
+                    chunk = f.read(min(PDF_CHUNK, remaining))
+                    if not chunk:  # file shrank mid-transfer: drop the connection rather than hang the client
+                        self.close_connection = True
+                        break
+                    self.wfile.write(chunk); remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the browser closed the tab or seeked elsewhere
+
+
+def detect_mode(path):
+    """'pdf' for a PDF file or a folder of PDFs, otherwise 'epub'."""
+    if path.is_file():
+        return 'pdf' if is_pdf_file(path) else 'epub'
+    if path.is_dir() and not (path / 'META-INF' / 'container.xml').is_file() and PdfLibrary(path).scan():
+        return 'pdf'
+    return 'epub'
+
+
+def run_server(handler, host, port, no_browser):
+    try: server = ThreadingHTTPServer((host, port), handler)
+    except OSError as exc:
+        sys.exit(f'error: could not listen on {host}:{port} ({exc.strerror or exc}). Is another copy already running? Try a different --port.')
+    url = f'http://{host}:{port}/'; print(f'serving at {url}  (Ctrl+C to stop)')
+    if not no_browser:
+        try: threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        except Exception: pass
+    try: server.serve_forever()
+    except KeyboardInterrupt: print('\nstopped')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('epub', help='.epub file, or a folder of already-extracted contents')
+    parser.add_argument('epub', metavar='path', help='.epub or .pdf file, or a folder: either extracted epub contents or PDFs to host')
     parser.add_argument('--port', type=int, default=8000); parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--no-browser', action='store_true', help="don't try to auto-open a browser tab")
     parser.add_argument('--verbose', action='store_true', help='log every request (failed requests are always logged)')
     args = parser.parse_args(); src_path = Path(args.epub)
     if not src_path.exists(): sys.exit(f'error: {src_path} not found')
+    if detect_mode(src_path) == 'pdf':
+        library = PdfLibrary(src_path); count = len(library.scan())
+        print(f'hosting {count} PDF file{"" if count == 1 else "s"} from {library.root}')
+        PdfHandler.library = library; PdfHandler.verbose = args.verbose
+        run_server(PdfHandler, args.host, args.port, args.no_browser); return
     try: book = Book(open_source(src_path))
     except Exception as exc: sys.exit(f'error: could not parse EPUB structure: {exc}')
     print(f'"{book.title}"' + (f' by {", ".join(book.authors)}' if book.authors else ''))
@@ -571,15 +799,7 @@ def main():
     if book.obfuscated_fonts: print(f'{len(book.obfuscated_fonts)} obfuscated font(s) will be de-obfuscated on the fly')
     if book.has_drm: print(f'warning: {len(book.drm_paths)} resource(s) are DRM-protected and will not be viewable')
     ReaderHandler.book = book; ReaderHandler.verbose = args.verbose
-    try: server = ThreadingHTTPServer((args.host, args.port), ReaderHandler)
-    except OSError as exc:
-        sys.exit(f'error: could not listen on {args.host}:{args.port} ({exc.strerror or exc}). Is another copy already running? Try a different --port.')
-    url = f'http://{args.host}:{args.port}/'; print(f'serving at {url}  (Ctrl+C to stop)')
-    if not args.no_browser:
-        try: threading.Timer(0.5, lambda: webbrowser.open(url)).start()
-        except Exception: pass
-    try: server.serve_forever()
-    except KeyboardInterrupt: print('\nstopped')
+    run_server(ReaderHandler, args.host, args.port, args.no_browser)
 
 
 if __name__ == '__main__': main()
