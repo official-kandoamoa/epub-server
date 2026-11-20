@@ -80,8 +80,12 @@ ADOBE_FONT_ALG = 'http://ns.adobe.com/pdf/enc#RC'
 FONT_OBFUSCATION_WINDOWS = {IDPF_FONT_ALG: 1040, ADOBE_FONT_ALG: 1024}
 RTL_LANGUAGES = {'ar', 'he', 'fa', 'ur', 'yi', 'ps', 'sd', 'dv', 'ckb', 'syr'}
 
-for ext, ctype in [('.woff2', 'font/woff2'), ('.woff', 'font/woff'),
-                    ('.ttf', 'font/ttf'), ('.otf', 'font/otf')]:
+for ext, ctype in [
+    ('.woff2', 'font/woff2'),
+    ('.woff', 'font/woff'),
+    ('.ttf', 'font/ttf'),
+    ('.otf', 'font/otf'),
+]:
     mimetypes.add_type(ctype, ext)
 
 
@@ -139,8 +143,7 @@ class DirSource:
     @staticmethod
     def _candidates(name):
         seen = set()
-        for form in (name, unicodedata.normalize('NFC', name),
-                     unicodedata.normalize('NFD', name)):
+        for form in (name, unicodedata.normalize('NFC', name), unicodedata.normalize('NFD', name)):
             if form not in seen:
                 seen.add(form)
                 yield form
@@ -156,14 +159,19 @@ def sniff_text(raw):
     # The 'utf-16' codec reads the BOM to pick the byte order *and* consumes it; 'utf-16-le'/'-be'
     # would leave a U+FEFF at the start of the text, which stops the leading <?xml ...?>
     # declaration from being recognised and stripped (so the chapter fell back to HTML mode).
-    for bom, enc in ((b'\xef\xbb\xbf', 'utf-8-sig'),
-                      (b'\xff\xfe', 'utf-16'), (b'\xfe\xff', 'utf-16')):
+    for bom, enc in (
+        (b'\xef\xbb\xbf', 'utf-8-sig'),
+        (b'\xff\xfe', 'utf-16'),
+        (b'\xfe\xff', 'utf-16'),
+    ):
         if raw.startswith(bom):
             return raw.decode(enc, errors='replace')
     head = raw[:1024].decode('ascii', errors='ignore')
-    m = (re.search(r'encoding=["\']([\w-]+)["\']', head, re.IGNORECASE) or
-         re.search(r'@charset\s+["\']([\w-]+)["\']', head, re.IGNORECASE) or
-         re.search(r'charset=["\']?([\w-]+)', head, re.IGNORECASE))
+    m = (
+        re.search(r'encoding=["\']([\w-]+)["\']', head, re.IGNORECASE)
+        or re.search(r'@charset\s+["\']([\w-]+)["\']', head, re.IGNORECASE)
+        or re.search(r'charset=["\']?([\w-]+)', head, re.IGNORECASE)
+    )
     for enc in filter(None, [m.group(1) if m else None, 'utf-8']):
         try:
             return raw.decode(enc)
@@ -280,9 +288,14 @@ class Book:
 
     def _parse_opf(self):
         root = ET.fromstring(self.source.read(self.opf_path))
+
         def texts(tag):
-            return [el.text.strip() for el in root.findall(f'.//dc:{tag}', DC_NS)
-                    if el.text and el.text.strip()]
+            return [
+                el.text.strip()
+                for el in root.findall(f'.//dc:{tag}', DC_NS)
+                if el.text and el.text.strip()
+            ]
+
         titles, languages = texts('title'), texts('language')
         unique_ref, identifier = root.get('unique-identifier'), None
         for el in root.findall('.//dc:identifier', DC_NS):
@@ -294,65 +307,101 @@ class Book:
             href, item_id = item.get('href'), item.get('id')
             if href and item_id:
                 path, _ = resolve_href(href, self.opf_dir)
-                manifest[item_id] = ManifestItem(item_id, path, item.get('media-type', ''),
-                                                 frozenset((item.get('properties') or '').split()))
+                manifest[item_id] = ManifestItem(
+                    item_id,
+                    path,
+                    item.get('media-type', ''),
+                    frozenset((item.get('properties') or '').split()),
+                )
         spine_el, spine = root.find('.//opf:spine', OPF_NS), []
         if spine_el is not None:
             for itemref in spine_el.findall('opf:itemref', OPF_NS):
                 mi = manifest.get(itemref.get('idref'))
-                if mi and mi.href: spine.append(mi.href)
+                if mi and mi.href:
+                    spine.append(mi.href)
         toc_ref = None
         nav_item = next((mi for mi in manifest.values() if 'nav' in mi.properties), None)
-        if nav_item: toc_ref = ('nav', nav_item.href)
+        if nav_item:
+            toc_ref = ('nav', nav_item.href)
         if toc_ref is None and spine_el is not None:
             ncx_item = manifest.get(spine_el.get('toc', ''))
-            if ncx_item: toc_ref = ('ncx', ncx_item.href)
+            if ncx_item:
+                toc_ref = ('ncx', ncx_item.href)
         if toc_ref is None:
-            ncx_item = next((mi for mi in manifest.values() if mi.media_type == 'application/x-dtbncx+xml'), None)
-            if ncx_item: toc_ref = ('ncx', ncx_item.href)
+            ncx_item = next(
+                (mi for mi in manifest.values() if mi.media_type == 'application/x-dtbncx+xml'),
+                None,
+            )
+            if ncx_item:
+                toc_ref = ('ncx', ncx_item.href)
         cover_item = next((mi for mi in manifest.values() if 'cover-image' in mi.properties), None)
         cover = cover_item.href if cover_item else None
         if cover is None:
             meta_cover = root.find(".//opf:metadata/opf:meta[@name='cover']", OPF_NS)
             if meta_cover is not None:
                 mi = manifest.get(meta_cover.get('content', ''))
-                if mi: cover = mi.href
+                if mi:
+                    cover = mi.href
         self.title = titles[0] if titles else 'Untitled'
-        self.authors, self.language, self.identifier = texts('creator'), (languages[0] if languages else None), identifier
-        self.manifest, self.spine, self._toc_ref, self._cover_candidate = manifest, spine, toc_ref, cover
+        self.authors, self.language, self.identifier = (
+            texts('creator'),
+            (languages[0] if languages else None),
+            identifier,
+        )
+        self.manifest, self.spine, self._toc_ref, self._cover_candidate = (
+            manifest,
+            spine,
+            toc_ref,
+            cover,
+        )
 
     def _resolve_cover(self):
-        if not self._cover_candidate: return None
-        try: self.source.read(self._cover_candidate)
-        except (KeyError, FileNotFoundError): return None
+        if not self._cover_candidate:
+            return None
+        try:
+            self.source.read(self._cover_candidate)
+        except (KeyError, FileNotFoundError):
+            return None
         return self._cover_candidate
 
     def _parse_encryption(self):
-        try: raw = self.source.read('META-INF/encryption.xml')
-        except (KeyError, FileNotFoundError): return {}, {}
-        try: root = ET.fromstring(raw)
-        except ET.ParseError: return {}, {}
+        try:
+            raw = self.source.read('META-INF/encryption.xml')
+        except (KeyError, FileNotFoundError):
+            return {}, {}
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            return {}, {}
         obfuscated, drm = {}, {}
         for ed in _find_descendants(root, 'EncryptedData', XML_ENC_NS_URI):
             method = _find_child(ed, 'EncryptionMethod', XML_ENC_NS_URI)
             alg = method.get('Algorithm', '') if method is not None else ''
             cipher_data = _find_child(ed, 'CipherData', XML_ENC_NS_URI)
-            ref = _find_child(cipher_data, 'CipherReference', XML_ENC_NS_URI) if cipher_data is not None else None
-            if ref is None or not ref.get('URI'): continue
+            ref = (
+                _find_child(cipher_data, 'CipherReference', XML_ENC_NS_URI)
+                if cipher_data is not None
+                else None
+            )
+            if ref is None or not ref.get('URI'):
+                continue
             path, _ = resolve_href(ref.get('URI'), '')
             (obfuscated if alg in FONT_OBFUSCATION_WINDOWS else drm)[path] = alg or 'unknown'
         return obfuscated, drm
 
-    def is_drm(self, path): return path in self.drm_paths
+    def is_drm(self, path):
+        return path in self.drm_paths
 
     def read_resource(self, path):
-        if path in self.drm_paths: raise DrmProtectedError(path, self.drm_paths[path])
+        if path in self.drm_paths:
+            raise DrmProtectedError(path, self.drm_paths[path])
         raw = self.source.read(path)
         alg = self.obfuscated_fonts.get(path)
         return deobfuscate_font(raw, alg, self.identifier) if alg else raw
 
     def _build_toc(self):
-        if not self._toc_ref: return []
+        if not self._toc_ref:
+            return []
         kind, path = self._toc_ref
         return self._parse_nav_toc(path) if kind == 'nav' else self._parse_ncx_toc(path)
 
@@ -361,9 +410,12 @@ class Book:
         toc_nav = None
         for nav in _find_descendants(root, 'nav', XHTML_NS_URI):
             t = nav.get(f'{{{EPUB_OPS_NS_URI}}}type', '') or nav.get('type', '')
-            if 'toc' in t.split(): toc_nav = nav; break
+            if 'toc' in t.split():
+                toc_nav = nav
+                break
         navs = _find_descendants(root, 'nav', XHTML_NS_URI)
-        if toc_nav is None and navs: toc_nav = navs[0]  # no epub:type="toc" found - best guess
+        if toc_nav is None and navs:
+            toc_nav = navs[0]  # no epub:type="toc" found - best guess
         ol = _find_child(toc_nav, 'ol', XHTML_NS_URI) if toc_nav is not None else None
         return self._parse_nav_ol(ol, base_dir) if ol is not None else []
 
@@ -371,15 +423,21 @@ class Book:
         entries = []
         for li in _find_children(ol, 'li', XHTML_NS_URI):
             a = _find_child(li, 'a', XHTML_NS_URI)
-            # `a or ...` would be a bug: an Element with no child tags is falsy, so a plain <a>text</a> was skipped.
+            # `a or ...` would be a bug: an Element with no child tags is falsy, so a
+            # plain <a>text</a> was skipped.
             label = a if a is not None else _find_child(li, 'span', XHTML_NS_URI)
             title = ' '.join(''.join(label.itertext()).split()) if label is not None else ''
             path = frag = ''
-            if a is not None and a.get('href') and not a.get('href').startswith(('http://', 'https://', 'mailto:')):
+            if (
+                a is not None
+                and a.get('href')
+                and not a.get('href').startswith(('http://', 'https://', 'mailto:'))
+            ):
                 path, frag = resolve_href(a.get('href'), base_dir)
             child = _find_child(li, 'ol', XHTML_NS_URI)
             children = self._parse_nav_ol(child, base_dir) if child is not None else []
-            if title or children: entries.append(TocEntry(title or path or 'Untitled', path, frag, children))
+            if title or children:
+                entries.append(TocEntry(title or path or 'Untitled', path, frag, children))
         return entries
 
     def _parse_ncx_toc(self, ncx_path):
@@ -395,26 +453,55 @@ class Book:
             title = ' '.join((text_el.text or '').split()) if text_el is not None else ''
             content = _find_child(np, 'content', NCX_NS_URI)
             path = frag = ''
-            if content is not None and content.get('src'): path, frag = resolve_href(content.get('src'), base_dir)
+            if content is not None and content.get('src'):
+                path, frag = resolve_href(content.get('src'), base_dir)
             children = self._parse_navpoints(np, base_dir)
-            if title or children: entries.append(TocEntry(title or path or 'Untitled', path, frag, children))
+            if title or children:
+                entries.append(TocEntry(title or path or 'Untitled', path, frag, children))
         return entries
 
     def _collect_titles(self):
         titles = {}
         for path in self.spine:
             fallback = posixpath.splitext(posixpath.basename(path))[0]
-            try: text = sniff_text(self.read_resource(path))
-            except (KeyError, FileNotFoundError, DrmProtectedError): titles[path] = fallback; continue
+            try:
+                text = sniff_text(self.read_resource(path))
+            except (KeyError, FileNotFoundError, DrmProtectedError):
+                titles[path] = fallback
+                continue
             m = first_real_match(TITLE_RE, text) or first_real_match(H1_RE, text)
             titles[path] = html.unescape(TAG_RE.sub('', m.group(1))).strip() if m else fallback
         return titles
 
-    def resolve(self, url_path): return posixpath.normpath(unquote(url_path).lstrip('/'))
+    def resolve(self, url_path):
+        return posixpath.normpath(unquote(url_path).lstrip('/'))
 
 
-NAV_CSS = '<style>#__reader_nav{position:sticky;top:0;background:#222;color:#eee;font-family:sans-serif;font-size:14px;padding:8px 14px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;z-index:9999}#__reader_nav a{color:#9cf;text-decoration:none;white-space:nowrap}#__reader_nav a:hover{text-decoration:underline}#__reader_nav .sp{flex:1 1 auto}#__reader_nav .mid{display:flex;align-items:baseline;gap:8px;min-width:0}#__reader_nav .ch{max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#__reader_nav .pos{opacity:.7;white-space:nowrap}</style>'
-INDEX_CSS = 'body{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px}li{margin:6px 0}ol ol{margin-top:6px}.toc-heading{font-weight:bold;color:#444}.cover{display:block;max-width:220px;max-height:320px;margin:0 auto 20px;box-shadow:0 2px 10px rgba(0,0,0,.25)}.byline{color:#555;margin-top:-8px}.drm-notice{background:#fff3e0;border:1px solid #ffcc80;padding:10px 14px;border-radius:6px;font-size:14px}.lock{opacity:.6;font-size:.85em}'
+NAV_CSS = (
+    '<style>'
+    '#__reader_nav{position:sticky;top:0;background:#222;color:#eee;font-family:sans-serif;'
+    'font-size:14px;padding:8px 14px;display:flex;flex-wrap:wrap;gap:8px 16px;'
+    'align-items:center;z-index:9999}'
+    '#__reader_nav a{color:#9cf;text-decoration:none;white-space:nowrap}'
+    '#__reader_nav a:hover{text-decoration:underline}'
+    '#__reader_nav .sp{flex:1 1 auto}'
+    '#__reader_nav .mid{display:flex;align-items:baseline;gap:8px;min-width:0}'
+    '#__reader_nav .ch{max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
+    '#__reader_nav .pos{opacity:.7;white-space:nowrap}'
+    '</style>'
+)
+INDEX_CSS = (
+    'body{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px}'
+    'li{margin:6px 0}'
+    'ol ol{margin-top:6px}'
+    '.toc-heading{font-weight:bold;color:#444}'
+    '.cover{display:block;max-width:220px;max-height:320px;margin:0 auto 20px;'
+    'box-shadow:0 2px 10px rgba(0,0,0,.25)}'
+    '.byline{color:#555;margin-top:-8px}'
+    '.drm-notice{background:#fff3e0;border:1px solid #ffcc80;padding:10px 14px;'
+    'border-radius:6px;font-size:14px}'
+    '.lock{opacity:.6;font-size:.85em}'
+)
 
 
 def make_link(path, fragment=''):
@@ -425,37 +512,86 @@ def make_link(path, fragment=''):
 def make_nav_bar(book, current_path):
     idx = book.spine.index(current_path) if current_path in book.spine else -1
     prev = f'<a href="{make_link(book.spine[idx-1])}">&#8592; Prev</a>' if idx > 0 else ''
-    nxt = f'<a href="{make_link(book.spine[idx+1])}">Next &#8594;</a>' if 0 <= idx < len(book.spine)-1 else ''
+    nxt = (
+        f'<a href="{make_link(book.spine[idx+1])}">Next &#8594;</a>'
+        if 0 <= idx < len(book.spine) - 1
+        else ''
+    )
     title = html.escape(book.titles.get(current_path, ''))
     pos = f'{idx+1} / {len(book.spine)}' if idx >= 0 else ''
-    middle = f'<span class="mid"><span class="ch" title="{title}">{title}</span><span class="pos">{pos}</span></span>' if title or pos else ''
-    return f'{NAV_CSS}<div id="__reader_nav"><a href="/">&#8962; Contents</a>{prev}<span class="sp"></span>{middle}<span class="sp"></span>{nxt}</div>'
+    middle = (
+        f'<span class="mid"><span class="ch" title="{title}">{title}</span>'
+        f'<span class="pos">{pos}</span></span>'
+        if title or pos
+        else ''
+    )
+    return (
+        f'{NAV_CSS}<div id="__reader_nav"><a href="/">&#8962; Contents</a>{prev}'
+        f'<span class="sp"></span>{middle}<span class="sp"></span>{nxt}</div>'
+    )
 
 
-def _lock_badge(book, path): return ' <span class="lock" title="DRM-protected">🔒</span>' if book.is_drm(path) else ''
+def _lock_badge(book, path):
+    return ' <span class="lock" title="DRM-protected">🔒</span>' if book.is_drm(path) else ''
 
 
 def render_toc_entries(entries, book):
     items = []
     for e in entries:
-        content = (f'<a href="{make_link(e.path, e.fragment)}">{html.escape(e.title)}</a>{_lock_badge(book, e.path)}' if e.path else f'<span class="toc-heading">{html.escape(e.title)}</span>')
-        if e.children: content += render_toc_entries(e.children, book)
+        content = (
+            f'<a href="{make_link(e.path, e.fragment)}">{html.escape(e.title)}</a>'
+            f'{_lock_badge(book, e.path)}'
+            if e.path
+            else f'<span class="toc-heading">{html.escape(e.title)}</span>'
+        )
+        if e.children:
+            content += render_toc_entries(e.children, book)
         items.append(f'<li>{content}</li>')
     return f'<ol>{"".join(items)}</ol>' if items else ''
 
 
 def render_flat_list(book):
-    return '<ol>' + ''.join(f'<li><a href="{make_link(p)}">{html.escape(book.titles.get(p, p))}</a>{_lock_badge(book, p)}</li>' for p in book.spine) + '</ol>'
+    return (
+        '<ol>'
+        + ''.join(
+            f'<li><a href="{make_link(p)}">{html.escape(book.titles.get(p, p))}</a>'
+            f'{_lock_badge(book, p)}</li>'
+            for p in book.spine
+        )
+        + '</ol>'
+    )
 
 
 def make_index_html(book):
     toc = render_toc_entries(book.toc, book) if book.toc else render_flat_list(book)
-    author = f'<p class="byline">by {html.escape(", ".join(book.authors))}</p>' if book.authors else ''
+    author = (
+        f'<p class="byline">by {html.escape(", ".join(book.authors))}</p>' if book.authors else ''
+    )
     cover = f'<img class="cover" src="{make_link(book.cover)}" alt="Cover">' if book.cover else ''
-    drm = '<p class="drm-notice">🔒 Part of this book is DRM-protected; those pages can\'t be shown here.</p>' if book.has_drm else ''
+    drm = (
+        '<p class="drm-notice">🔒 Part of this book is DRM-protected; '
+        'those pages can\'t be shown here.</p>'
+        if book.has_drm
+        else ''
+    )
     direction = ' dir="rtl"' if is_rtl_language(book.language) else ''
-    return f'<!DOCTYPE html><html{direction}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{html.escape(book.title)}</title><style>{INDEX_CSS}</style></head><body>{cover}<h1>{html.escape(book.title)}</h1>{author}{drm}{toc}</body></html>'
+    title = html.escape(book.title)
+    return (
+        f'<!DOCTYPE html><html{direction}><head>{HTML_META}'
+        f'<title>{title}</title><style>{INDEX_CSS}</style></head>'
+        f'<body>{cover}<h1>{title}</h1>{author}{drm}{toc}</body></html>'
+    )
 
+
+HTML_META = (
+    '<meta charset="utf-8">' '<meta name="viewport" content="width=device-width, initial-scale=1">'
+)
+
+DRM_MESSAGE = (
+    b'This part of the book is protected by DRM (rights-management encryption). '
+    b"This tool doesn't attempt to circumvent real content protection, "
+    b"so it can't display it."
+)
 
 _XML_ONLY_ENTITIES = {'lt', 'gt', 'amp', 'quot', 'apos'}
 _ENTITY_REF_RE = re.compile(r'&([A-Za-z][A-Za-z0-9]*);')
@@ -472,15 +608,19 @@ def numeric_entities(text):
     HTML5 doctype or none at all. Numeric references are valid everywhere.
     Comments and CDATA sections are left alone: there, "&nbsp;" is literal
     text (e.g. a code sample) and must stay exactly as written."""
+
     def repl(m):
         name = m.group(1)
-        if name in _XML_ONLY_ENTITIES: return m.group(0)
+        if name in _XML_ONLY_ENTITIES:
+            return m.group(0)
         codepoint = html_entities.name2codepoint.get(name)
         return f'&#{codepoint};' if codepoint is not None else m.group(0)
 
     out, pos = [], 0
     for m in _COMMENT_OR_CDATA_RE.finditer(text):
-        out.append(_ENTITY_REF_RE.sub(repl, text[pos:m.start()])); out.append(m.group(0)); pos = m.end()
+        out.append(_ENTITY_REF_RE.sub(repl, text[pos : m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
     out.append(_ENTITY_REF_RE.sub(repl, text[pos:]))
     return ''.join(out)
 
@@ -497,7 +637,8 @@ def is_wellformed_xhtml(text):
     entities don't cause a false "not well-formed"."""
     parser = ET.XMLParser()
     try:
-        parser.feed(text.encode('utf-8')); root = parser.close()
+        parser.feed(text.encode('utf-8'))
+        root = parser.close()
     except (ET.ParseError, ValueError):
         return False
     return root.tag == f'{{{XHTML_NS_URI}}}html'
@@ -507,43 +648,75 @@ class ReaderHandler(BaseHTTPRequestHandler):
     book = None
     verbose = False
     _head_only = False
-    def log_message(self, fmt, *args): pass  # all request logging goes through log_request below
+
+    def log_message(self, fmt, *args):
+        pass  # all request logging goes through log_request below
+
     def log_request(self, code='-', size='-'):
         # Always surface failures (a 404 for a stylesheet or font is the usual
         # reason a book looks wrong); log every request with --verbose.
-        try: failed = int(code) >= 400
-        except (TypeError, ValueError): failed = False
-        if self.verbose or failed: print(f'{code} {self.command} {self.path}', file=sys.stderr)
+        try:
+            failed = int(code) >= 400
+        except (TypeError, ValueError):
+            failed = False
+        if self.verbose or failed:
+            print(f'{code} {self.command} {self.path}', file=sys.stderr)
+
     def do_GET(self):
-        try: self._route()
+        try:
+            self._route()
         except Exception as exc:
-            traceback.print_exc(); self._send(500, f'Internal error: {exc}'.encode('utf-8', 'replace'), 'text/plain; charset=utf-8')
+            traceback.print_exc()
+            self._send(
+                500,
+                f'Internal error: {exc}'.encode('utf-8', 'replace'),
+                'text/plain; charset=utf-8',
+            )
+
     def do_HEAD(self):  # same status and headers as GET, no body
-        self._head_only = True; self.do_GET()
+        self._head_only = True
+        self.do_GET()
+
     def _route(self):
         path = self.path.split('?', 1)[0]
-        if path == '/': self._send(200, make_index_html(self.book).encode(), 'text/html; charset=utf-8')
-        elif path.startswith('/book/'): self._serve_epub_file(self.book.resolve(path[6:]))
+        if path == '/':
+            self._send(200, make_index_html(self.book).encode(), 'text/html; charset=utf-8')
+        elif path.startswith('/book/'):
+            self._serve_epub_file(self.book.resolve(path[6:]))
         else:
             # Some books reference resources by a root-absolute URL such as href="/styles/main.css"
             # or src="/OEBPS/images/a.png", meaning "from the root of the book". Serve those too,
             # trying the epub root first, then the package folder.
             rel = self.book.resolve(path)
-            candidates = [rel] + ([posixpath.normpath(posixpath.join(self.book.opf_dir, rel))] if self.book.opf_dir else [])
+            candidates = [rel] + (
+                [posixpath.normpath(posixpath.join(self.book.opf_dir, rel))]
+                if self.book.opf_dir
+                else []
+            )
             found = None
             for candidate in candidates:
-                try: self.book.read_resource(candidate)
-                except (KeyError, FileNotFoundError): continue
-                except DrmProtectedError: pass  # it exists; _serve_epub_file will send the DRM notice
-                found = candidate; break
-            if found is None: self._send(404, b'Not found', 'text/plain; charset=utf-8')
-            else: self._serve_epub_file(found)
+                try:
+                    self.book.read_resource(candidate)
+                except (KeyError, FileNotFoundError):
+                    continue
+                except DrmProtectedError:
+                    pass  # it exists; _serve_epub_file will send the DRM notice
+                found = candidate
+                break
+            if found is None:
+                self._send(404, b'Not found', 'text/plain; charset=utf-8')
+            else:
+                self._serve_epub_file(found)
+
     def _serve_epub_file(self, epub_path):
-        try: raw = self.book.read_resource(epub_path)
+        try:
+            raw = self.book.read_resource(epub_path)
         except DrmProtectedError:
-            self._send(403, b"This part of the book is protected by DRM (rights-management encryption). This tool doesn't attempt to circumvent real content protection, so it can't display it.", 'text/plain; charset=utf-8'); return
+            self._send(403, DRM_MESSAGE, 'text/plain; charset=utf-8')
+            return
         except (KeyError, FileNotFoundError):
-            self._send(404, f'Not found in EPUB: {epub_path}'.encode(), 'text/plain; charset=utf-8'); return
+            self._send(404, f'Not found in EPUB: {epub_path}'.encode(), 'text/plain; charset=utf-8')
+            return
         lower = epub_path.lower()
         if lower.endswith(('.xhtml', '.html', '.htm')):
             text, nav = XML_DECL_RE.sub('', sniff_text(raw)), make_nav_bar(self.book, epub_path)
@@ -553,14 +726,23 @@ class ReaderHandler(BaseHTTPRequestHandler):
             # intended; anything sloppy falls back to the forgiving HTML parser rather than
             # showing an XML error page.
             xml_text = numeric_entities(text)
-            if is_wellformed_xhtml(xml_text): self._send(200, xml_text.encode(), 'application/xhtml+xml; charset=utf-8')
-            else: self._send(200, text.encode(), 'text/html; charset=utf-8')
-        elif lower.endswith('.css'): self._send(200, sniff_text(raw).encode(), 'text/css; charset=utf-8')
+            if is_wellformed_xhtml(xml_text):
+                self._send(200, xml_text.encode(), 'application/xhtml+xml; charset=utf-8')
+            else:
+                self._send(200, text.encode(), 'text/html; charset=utf-8')
+        elif lower.endswith('.css'):
+            self._send(200, sniff_text(raw).encode(), 'text/css; charset=utf-8')
         else:
-            ctype, _ = mimetypes.guess_type(lower); self._send(200, raw, ctype or 'application/octet-stream')
+            ctype, _ = mimetypes.guess_type(lower)
+            self._send(200, raw, ctype or 'application/octet-stream')
+
     def _send(self, status, body, ctype):
-        self.send_response(status); self.send_header('Content-Type', ctype); self.send_header('Content-Length', str(len(body))); self.end_headers()
-        if not self._head_only: self.wfile.write(body)
+        self.send_response(status)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        if not self._head_only:
+            self.wfile.write(body)
 
 
 # ---------------------------------------------------------------------------
@@ -571,13 +753,22 @@ PDF_MAGIC = b'%PDF-'
 PDF_CHUNK = 64 * 1024
 PDF_URL_RE = re.compile(r'/(view|pdf|dl)/([0-9a-f]{12})')
 
-PDF_CSS = ('body{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px}li{margin:8px 0}'
-           '.meta{color:#666;font-size:.85em;margin-left:6px}.dl{font-size:.85em;margin-left:10px}'
-           'body.viewer{max-width:none;margin:0;padding:0;height:100vh;display:flex;flex-direction:column}'
-           '#bar{background:#222;color:#eee;font-size:14px;padding:8px 14px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}'
-           '#bar a{color:#9cf;text-decoration:none;white-space:nowrap}#bar a:hover{text-decoration:underline}'
-           '#bar .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:0 1 auto}#bar .sp{flex:1 1 auto}'
-           'object{flex:1 1 auto;width:100%;border:0}object p{padding:16px}')
+PDF_CSS = (
+    'body{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px}'
+    'li{margin:8px 0}'
+    '.meta{color:#666;font-size:.85em;margin-left:6px}'
+    '.dl{font-size:.85em;margin-left:10px}'
+    'body.viewer{max-width:none;margin:0;padding:0;height:100vh;'
+    'display:flex;flex-direction:column}'
+    '#bar{background:#222;color:#eee;font-size:14px;padding:8px 14px;display:flex;'
+    'flex-wrap:wrap;gap:8px 16px;align-items:center}'
+    '#bar a{color:#9cf;text-decoration:none;white-space:nowrap}'
+    '#bar a:hover{text-decoration:underline}'
+    '#bar .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:0 1 auto}'
+    '#bar .sp{flex:1 1 auto}'
+    'object{flex:1 1 auto;width:100%;border:0}'
+    'object p{padding:16px}'
+)
 
 
 def is_pdf_file(path):
@@ -622,8 +813,11 @@ class PdfLibrary:
             found, base = [], self.root
             for dirpath, dirnames, filenames in os.walk(self.root):
                 dirnames[:] = sorted(d for d in dirnames if not d.startswith('.'))
-                found.extend(Path(dirpath, f) for f in sorted(filenames)
-                             if f.lower().endswith('.pdf') and not f.startswith('.'))
+                found.extend(
+                    Path(dirpath, f)
+                    for f in sorted(filenames)
+                    if f.lower().endswith('.pdf') and not f.startswith('.')
+                )
             found.sort(key=lambda p: str(p.relative_to(base)).lower())
         entries = []
         for p in found:
@@ -671,31 +865,44 @@ def parse_byte_range(header, size):
 
 def content_disposition(kind, filename):
     ascii_name = re.sub(r'[^\x20-\x7e]|["\\]', '_', filename)
-    return f'{kind}; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(filename, safe="", errors="replace")}'
+    encoded = quote(filename, safe='', errors='replace')
+    return f'{kind}; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded}'
 
 
 def make_pdf_library_html(entries):
     if entries:
         items = ''.join(
-            f'<li><a href="/view/{e.id}">{html.escape(e.name)}</a><span class="meta">{human_size(e.size)}</span>'
-            f'<a class="dl" href="/dl/{e.id}">download</a></li>' for e in entries)
+            f'<li><a href="/view/{e.id}">{html.escape(e.name)}</a>'
+            f'<span class="meta">{human_size(e.size)}</span>'
+            f'<a class="dl" href="/dl/{e.id}">download</a></li>'
+            for e in entries
+        )
         body = f'<ol>{items}</ol>'
     else:
         body = '<p>No PDF files found.</p>'
-    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
-            f'<title>PDF library</title><style>{PDF_CSS}</style></head><body><h1>PDF library</h1>{body}</body></html>')
+    return (
+        f'<!DOCTYPE html><html><head>{HTML_META}'
+        f'<title>PDF library</title><style>{PDF_CSS}</style></head>'
+        f'<body><h1>PDF library</h1>{body}</body></html>'
+    )
 
 
 def make_pdf_viewer_html(entry, show_back):
     title = html.escape(entry.title)
     back = '<a href="/">&#8962; Library</a>' if show_back else ''
     src, dl = f'/pdf/{entry.id}', f'/dl/{entry.id}'
-    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
-            f'<title>{title}</title><style>{PDF_CSS}</style></head><body class="viewer">'
-            f'<div id="bar">{back}<span class="t" title="{title}">{title}</span><span class="sp"></span>'
-            f'<a href="{src}" target="_blank">Open in new tab</a><a href="{dl}">Download</a></div>'
-            f'<object data="{src}" type="application/pdf"><p>Your browser can\'t show PDFs inline. '
-            f'<a href="{src}">Open it</a> or <a href="{dl}">download it</a>.</p></object></body></html>')
+    return (
+        f'<!DOCTYPE html><html><head>{HTML_META}'
+        f'<title>{title}</title><style>{PDF_CSS}</style></head><body class="viewer">'
+        f'<div id="bar">{back}<span class="t" title="{title}">{title}</span>'
+        f'<span class="sp"></span>'
+        f'<a href="{src}" target="_blank">Open in new tab</a>'
+        f'<a href="{dl}">Download</a></div>'
+        f'<object data="{src}" type="application/pdf">'
+        f'<p>Your browser can\'t show PDFs inline. '
+        f'<a href="{src}">Open it</a> or <a href="{dl}">download it</a>.</p>'
+        f'</object></body></html>'
+    )
 
 
 class PdfHandler(ReaderHandler):
@@ -706,7 +913,11 @@ class PdfHandler(ReaderHandler):
         entries = self.library.scan()
         if path == '/':
             if self.library.single and entries:
-                self._send(200, make_pdf_viewer_html(entries[0], show_back=False).encode(), 'text/html; charset=utf-8')
+                self._send(
+                    200,
+                    make_pdf_viewer_html(entries[0], show_back=False).encode(),
+                    'text/html; charset=utf-8',
+                )
             else:
                 self._send(200, make_pdf_library_html(entries).encode(), 'text/html; charset=utf-8')
             return
@@ -715,7 +926,11 @@ class PdfHandler(ReaderHandler):
         if entry is None:
             self._send(404, b'Not found', 'text/plain; charset=utf-8')
         elif m.group(1) == 'view':
-            self._send(200, make_pdf_viewer_html(entry, show_back=not self.library.single).encode(), 'text/html; charset=utf-8')
+            self._send(
+                200,
+                make_pdf_viewer_html(entry, show_back=not self.library.single).encode(),
+                'text/html; charset=utf-8',
+            )
         else:
             self._send_pdf(entry, 'attachment' if m.group(1) == 'dl' else 'inline')
 
@@ -729,8 +944,10 @@ class PdfHandler(ReaderHandler):
             size = os.fstat(f.fileno()).st_size
             byte_range = parse_byte_range(self.headers.get('Range'), size)
             if byte_range is False:
-                self.send_response(416); self.send_header('Content-Range', f'bytes */{size}')
-                self.send_header('Content-Length', '0'); self.end_headers()
+                self.send_response(416)
+                self.send_header('Content-Range', f'bytes */{size}')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
                 return
             start, end = byte_range if byte_range else (0, size - 1)
             length = max(end - start + 1, 0)
@@ -738,9 +955,12 @@ class PdfHandler(ReaderHandler):
             self.send_header('Content-Type', 'application/pdf')
             self.send_header('Accept-Ranges', 'bytes')
             self.send_header('Content-Length', str(length))
-            self.send_header('Content-Disposition', content_disposition(disposition, entry.path.name))
+            self.send_header(
+                'Content-Disposition', content_disposition(disposition, entry.path.name)
+            )
             self.send_header('X-Content-Type-Options', 'nosniff')
-            if byte_range: self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+            if byte_range:
+                self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
             self.end_headers()
             if self._head_only:
                 return
@@ -749,10 +969,13 @@ class PdfHandler(ReaderHandler):
             try:
                 while remaining > 0:
                     chunk = f.read(min(PDF_CHUNK, remaining))
-                    if not chunk:  # file shrank mid-transfer: drop the connection rather than hang the client
+                    if (
+                        not chunk
+                    ):  # file shrank mid-transfer: drop the connection rather than hang the client
                         self.close_connection = True
                         break
-                    self.wfile.write(chunk); remaining -= len(chunk)
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
             except (BrokenPipeError, ConnectionResetError):
                 pass  # the browser closed the tab or seeked elsewhere
 
@@ -761,45 +984,85 @@ def detect_mode(path):
     """'pdf' for a PDF file or a folder of PDFs, otherwise 'epub'."""
     if path.is_file():
         return 'pdf' if is_pdf_file(path) else 'epub'
-    if path.is_dir() and not (path / 'META-INF' / 'container.xml').is_file() and PdfLibrary(path).scan():
+    if (
+        path.is_dir()
+        and not (path / 'META-INF' / 'container.xml').is_file()
+        and PdfLibrary(path).scan()
+    ):
         return 'pdf'
     return 'epub'
 
 
 def run_server(handler, host, port, no_browser):
-    try: server = ThreadingHTTPServer((host, port), handler)
+    try:
+        server = ThreadingHTTPServer((host, port), handler)
     except OSError as exc:
-        sys.exit(f'error: could not listen on {host}:{port} ({exc.strerror or exc}). Is another copy already running? Try a different --port.')
-    url = f'http://{host}:{port}/'; print(f'serving at {url}  (Ctrl+C to stop)')
+        sys.exit(
+            f'error: could not listen on {host}:{port} ({exc.strerror or exc}). '
+            'Is another copy already running? Try a different --port.'
+        )
+    url = f'http://{host}:{port}/'
+    print(f'serving at {url}  (Ctrl+C to stop)')
     if not no_browser:
-        try: threading.Timer(0.5, lambda: webbrowser.open(url)).start()
-        except Exception: pass
-    try: server.serve_forever()
-    except KeyboardInterrupt: print('\nstopped')
+        try:
+            threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        except Exception:
+            pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print('\nstopped')
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('epub', metavar='path', help='.epub or .pdf file, or a folder: either extracted epub contents or PDFs to host')
-    parser.add_argument('--port', type=int, default=8000); parser.add_argument('--host', default='127.0.0.1')
-    parser.add_argument('--no-browser', action='store_true', help="don't try to auto-open a browser tab")
-    parser.add_argument('--verbose', action='store_true', help='log every request (failed requests are always logged)')
-    args = parser.parse_args(); src_path = Path(args.epub)
-    if not src_path.exists(): sys.exit(f'error: {src_path} not found')
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        'epub',
+        metavar='path',
+        help='.epub or .pdf file, or a folder: either extracted epub contents or PDFs to host',
+    )
+    parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--host', default='127.0.0.1')
+    parser.add_argument(
+        '--no-browser', action='store_true', help="don't try to auto-open a browser tab"
+    )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='log every request (failed requests are always logged)',
+    )
+    args = parser.parse_args()
+    src_path = Path(args.epub)
+    if not src_path.exists():
+        sys.exit(f'error: {src_path} not found')
     if detect_mode(src_path) == 'pdf':
-        library = PdfLibrary(src_path); count = len(library.scan())
+        library = PdfLibrary(src_path)
+        count = len(library.scan())
         print(f'hosting {count} PDF file{"" if count == 1 else "s"} from {library.root}')
-        PdfHandler.library = library; PdfHandler.verbose = args.verbose
-        run_server(PdfHandler, args.host, args.port, args.no_browser); return
-    try: book = Book(open_source(src_path))
-    except Exception as exc: sys.exit(f'error: could not parse EPUB structure: {exc}')
+        PdfHandler.library = library
+        PdfHandler.verbose = args.verbose
+        run_server(PdfHandler, args.host, args.port, args.no_browser)
+        return
+    try:
+        book = Book(open_source(src_path))
+    except Exception as exc:
+        sys.exit(f'error: could not parse EPUB structure: {exc}')
     print(f'"{book.title}"' + (f' by {", ".join(book.authors)}' if book.authors else ''))
     print(f'{len(book.spine)} chapters, OPF at {book.opf_path}')
-    if book.toc: print(f'table of contents: {len(book.toc)} top-level entries')
-    if book.obfuscated_fonts: print(f'{len(book.obfuscated_fonts)} obfuscated font(s) will be de-obfuscated on the fly')
-    if book.has_drm: print(f'warning: {len(book.drm_paths)} resource(s) are DRM-protected and will not be viewable')
-    ReaderHandler.book = book; ReaderHandler.verbose = args.verbose
+    if book.toc:
+        print(f'table of contents: {len(book.toc)} top-level entries')
+    if book.obfuscated_fonts:
+        print(f'{len(book.obfuscated_fonts)} obfuscated font(s) will be de-obfuscated on the fly')
+    if book.has_drm:
+        print(
+            f'warning: {len(book.drm_paths)} resource(s) are DRM-protected and will not be viewable'
+        )
+    ReaderHandler.book = book
+    ReaderHandler.verbose = args.verbose
     run_server(ReaderHandler, args.host, args.port, args.no_browser)
 
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    main()
