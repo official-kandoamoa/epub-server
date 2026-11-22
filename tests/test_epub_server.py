@@ -686,7 +686,7 @@ class EpubServerTests(TempDirCase):
         )
         for r in responses:
             self.assertEqual(r.headers.get('x-content-type-options'), 'nosniff', r.status)
-            self.assertEqual(r.headers.get('referrer-policy'), 'no-referrer', r.status)
+            self.assertEqual(r.headers.get('referrer-policy'), 'same-origin', r.status)
             self.assertEqual(r.headers.get('cross-origin-resource-policy'), 'same-origin', r.status)
             self.assertEqual(r.headers.get('content-security-policy'), es.build_csp(), r.status)
             # sent once, not twice
@@ -1419,6 +1419,57 @@ class ReviewFollowUpTests(TempDirCase):
             es.ReaderHandler.log_request(h, 404)
         self.assertNotIn('\x1b', err.getvalue())
         self.assertNotIn('\x07', err.getvalue())
+
+    def test_failed_request_log_names_the_page_that_asked_for_it(self):
+        handler = quiet_handler(es.ReaderHandler, book=None)
+        h = handler.__new__(handler)
+        h.verbose, h.command, h.path = False, 'GET', '/book/OEBPS/missing.css'
+        for referer, expected in (
+            ('http://127.0.0.1:8000/book/OEBPS/c%201.xhtml', 'requested by /book/OEBPS/c 1.xhtml'),
+            ('http://evil.example/secret?token=1', None),
+            (None, None),
+        ):
+            h.headers = {'Host': '127.0.0.1:8000'}
+            if referer:
+                h.headers['Referer'] = referer
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                es.ReaderHandler.log_request(h, 404)
+            line = err.getvalue()
+            self.assertIn('404 GET /book/OEBPS/missing.css', line)
+            if expected:
+                self.assertIn(expected, line)
+            else:
+                self.assertNotIn('requested by', line)
+                self.assertNotIn('evil', line)
+
+    def test_log_line_survives_a_request_that_never_got_its_headers_parsed(self):
+        handler = quiet_handler(es.ReaderHandler, book=None)
+        h = handler.__new__(handler)  # no .headers, as after a malformed request line
+        h.verbose, h.command, h.path = False, None, '/'
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            es.ReaderHandler.log_request(h, 400)
+        self.assertIn('400', err.getvalue())
+
+    def test_missing_resource_is_reported_when_a_page_loads_it_for_real(self):
+        files = main_epub_files()
+        files['OEBPS/c1.xhtml'] = (
+            b'<html xmlns="http://www.w3.org/1999/xhtml"><head><title>x</title>'
+            b'<link rel="stylesheet" href="nope.css"/></head><body>hi</body></html>'
+        )
+        epub = write_epub(self.tmp / 'brokenref.epub', files)
+        cli = Cli(epub)
+        try:
+            page = cli.get('/book/OEBPS/c1.xhtml')
+            cli.get(
+                '/book/OEBPS/nope.css',
+                {'Referer': f'http://127.0.0.1:{cli.port}/book/OEBPS/c1.xhtml'},
+            )
+        finally:
+            out, err = cli.stop()
+        self.assertEqual(page.status, 200)
+        self.assertIn('404 GET /book/OEBPS/nope.css  (requested by /book/OEBPS/c1.xhtml)', err)
 
     def test_stream_failure_after_headers_closes_the_connection(self):
         class Boom:

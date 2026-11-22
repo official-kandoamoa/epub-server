@@ -57,7 +57,7 @@ single `.pdf`, or a whole folder of them.
 
 - **Safe by default with untrusted books** — a book is untrusted input, so
   every response carries a Content-Security-Policy that blocks scripts,
-  remote resources, forms and framing, plus `nosniff`, `no-referrer` and
+  remote resources, forms and framing, plus `nosniff`, a same-origin-only referrer policy and
   same-origin resource headers. Use `--allow-scripts` / `--allow-remote` only
   for books you trust (each prints a startup warning). See [Security](#security).
 - **Fast and cached** — chapters are rendered once and kept in a size-bounded
@@ -169,7 +169,9 @@ new tab" or "Download" links in the viewer's top bar.
 
 - **A book looks unstyled or has missing images/fonts** — watch the terminal.
   Every failed request is printed (e.g. `404 GET /book/OEBPS/styles/x.css`),
-  which usually points straight at the broken reference inside the book. Use
+  and names the page that asked for it, e.g.
+  `404 GET /book/OEBPS/x.css  (requested by /book/OEBPS/c1.xhtml)`, which
+  usually points straight at the broken reference inside the book. Use
   `--verbose` to see every request.
 - **"Address already in use"** — another copy (or another program) is on that
   port. Pick a different one with `--port`.

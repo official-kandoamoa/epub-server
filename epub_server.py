@@ -57,7 +57,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 from xml.etree import ElementTree as ET
 
 CONTAINER_NS = {'c': 'urn:oasis:names:tc:opendocument:xmlns:container'}
@@ -1123,6 +1123,7 @@ def etag_matches(header, etag):
 def printable(text, limit=200):
     """`text` made safe to print: control characters (a terminal escape sequence in a
     request path, say) are shown as \\xNN, and it is cut off at `limit` characters."""
+    text = '-' if text is None else str(text)  # e.g. no request method when the line was garbage
     shown = ''.join(c if c.isprintable() else f'\\x{ord(c):02x}' for c in text[:limit])
     return shown + ('...' if len(text) > limit else '')
 
@@ -1136,7 +1137,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
     timeout = 60  # seconds a client may stall on the socket before its connection is dropped
     security_headers = {
         'X-Content-Type-Options': 'nosniff',
-        'Referrer-Policy': 'no-referrer',
+        'Referrer-Policy': 'same-origin',  # lets failed requests name the page that asked
         # Other sites can't embed this server's files (images, media, ...) into their pages.
         'Cross-Origin-Resource-Policy': 'same-origin',
     }
@@ -1153,7 +1154,22 @@ class ReaderHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             failed = False
         if self.verbose or failed:
-            print(f'{code} {printable(self.command)} {printable(self.path)}', file=sys.stderr)
+            line = f'{code} {printable(self.command)} {printable(self.path)}'
+            source = self._referring_page() if failed else None
+            if source:
+                line += f'  (requested by {source})'
+            print(line, file=sys.stderr)
+
+    def _referring_page(self):
+        """The page of ours that asked for this URL, from the Referer header, if any."""
+        headers = getattr(self, 'headers', None)  # absent if the request line itself was bad
+        referer = headers.get('Referer') if headers else None
+        if not referer:
+            return None
+        parts = urlsplit(referer)
+        if parts.netloc.lower() != (headers.get('Host') or '').strip().lower():
+            return None  # not one of our own pages: don't repeat what an outside site sent
+        return printable(unquote(parts.path), 120) or None
 
     def end_headers(self):
         # Every response gets these - including the ones the standard library generates for
