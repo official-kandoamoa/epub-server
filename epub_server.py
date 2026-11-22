@@ -43,12 +43,14 @@ import mimetypes
 import os
 import posixpath
 import re
+import stat
 import sys
 import threading
 import traceback
 import unicodedata
 import webbrowser
 import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -80,6 +82,20 @@ ADOBE_FONT_ALG = 'http://ns.adobe.com/pdf/enc#RC'
 FONT_OBFUSCATION_WINDOWS = {IDPF_FONT_ALG: 1040, ADOBE_FONT_ALG: 1024}
 RTL_LANGUAGES = {'ar', 'he', 'fa', 'ur', 'yi', 'ps', 'sd', 'dv', 'ckb', 'syr'}
 
+# Resource handling. Chapters, stylesheets and the book's metadata files are read fully into
+# memory (and the cap below stops a hostile or corrupt entry from exhausting it); anything
+# bigger than STREAM_THRESHOLD that isn't text - and all audio/video - is streamed in chunks
+# instead, with Range support so media can seek.
+MAX_INMEMORY_BYTES = 64 * 1024 * 1024
+STREAM_THRESHOLD = 4 * 1024 * 1024
+STREAM_CHUNK = 64 * 1024
+CHAPTER_CACHE_BYTES = 32 * 1024 * 1024
+TEXT_DOC_EXTS = ('.xhtml', '.html', '.htm')
+# Bump when the way chapters are processed changes, so browsers drop their cached copies.
+ETAG_SALT = 'e2'
+# Scripts inside a book are blocked by default; see --allow-scripts.
+EPUB_CSP = "script-src 'none'"
+
 for ext, ctype in [
     ('.woff2', 'font/woff2'),
     ('.woff', 'font/woff'),
@@ -87,6 +103,22 @@ for ext, ctype in [
     ('.otf', 'font/otf'),
 ]:
     mimetypes.add_type(ctype, ext)
+
+
+def warn(message):
+    """Report something that went wrong but isn't fatal, instead of hiding it."""
+    print(f'warning: {message}', file=sys.stderr)
+
+
+class ResourceTooLargeError(Exception):
+    def __init__(self, name, size, limit):
+        super().__init__(f'{name} is {size} bytes, over the {limit}-byte in-memory limit')
+        self.name, self.size, self.limit = name, size, limit
+
+
+def _check_size(name, size):
+    if size > MAX_INMEMORY_BYTES:
+        raise ResourceTooLargeError(name, size, MAX_INMEMORY_BYTES)
 
 
 class ZipSource:
@@ -97,15 +129,40 @@ class ZipSource:
         self._lock = threading.Lock()
         self._names = self._zf.namelist()
 
-    def read(self, name):
+    def _resolve(self, name):
+        """The ZipInfo for `name`, tolerating odd Unicode normalization / legacy encodings."""
+        try:
+            return self._zf.getinfo(name)
+        except KeyError:
+            alt = self._find_alt_name(name)
+            if alt is None:
+                raise
+            return self._zf.getinfo(alt)
+
+    def exists(self, name):
         with self._lock:
             try:
-                return self._zf.read(name)
+                self._resolve(name)
             except KeyError:
-                alt = self._find_alt_name(name)
-                if alt is None:
-                    raise
-                return self._zf.read(alt)
+                return False
+            return True
+
+    def read(self, name):
+        """The whole entry as bytes (refuses entries bigger than MAX_INMEMORY_BYTES)."""
+        with self._lock:
+            info = self._resolve(name)
+            _check_size(name, info.file_size)
+            return self._zf.read(info)
+
+    def open(self, name):
+        """Open an entry for streaming: (file object, size, validator).
+
+        Nothing is loaded up front, so this is safe for very large entries. The
+        validator changes whenever the entry's content does (used for ETags)."""
+        with self._lock:
+            info = self._resolve(name)
+            f = self._zf.open(info)
+        return f, info.file_size, f'{info.CRC:08x}-{info.file_size:x}'
 
     def _find_alt_name(self, name):
         target_nfc = unicodedata.normalize('NFC', name)
@@ -128,17 +185,45 @@ class DirSource:
     def __init__(self, path):
         self._root = Path(path).resolve()
 
-    def read(self, name):
+    def _locate(self, name):
+        """Find the regular file for `name` inside the root: (path, stat result)."""
         last_exc = None
         for candidate in self._candidates(name):
             try:
                 p = (self._root / candidate).resolve()
                 if self._root != p and self._root not in p.parents:
                     continue  # path escaped the root - never follow it
-                return p.read_bytes()
+                st = p.stat()
+                if stat.S_ISREG(st.st_mode):
+                    return p, st
             except (OSError, ValueError) as exc:  # ValueError: e.g. NUL byte in a crafted URL
                 last_exc = exc
         raise FileNotFoundError(name) from last_exc
+
+    def exists(self, name):
+        try:
+            self._locate(name)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def read(self, name):
+        """The whole file as bytes (refuses files bigger than MAX_INMEMORY_BYTES)."""
+        p, st = self._locate(name)
+        _check_size(name, st.st_size)
+        try:
+            return p.read_bytes()
+        except OSError as exc:
+            raise FileNotFoundError(name) from exc
+
+    def open(self, name):
+        """Open a file for streaming: (file object, size, validator)."""
+        p, st = self._locate(name)
+        try:
+            f = open(p, 'rb')
+        except OSError as exc:
+            raise FileNotFoundError(name) from exc
+        return f, st.st_size, f'{st.st_mtime_ns:x}-{st.st_size:x}'
 
     @staticmethod
     def _candidates(name):
@@ -272,10 +357,14 @@ class Book:
         self.obfuscated_fonts, self.drm_paths = self._parse_encryption()
         self.has_drm = bool(self.drm_paths)
         self.cover = self._resolve_cover()
-        self.titles = self._collect_titles()
+        self._titles = {}  # chapter path -> title, filled in on demand by title_for()
         try:
             self.toc = self._build_toc()
-        except Exception:
+        except Exception as exc:
+            warn(
+                f'could not read the table of contents ({type(exc).__name__}: {exc}); '
+                'showing a plain chapter list instead'
+            )
             self.toc = []
 
     def _find_opf(self):
@@ -358,9 +447,8 @@ class Book:
     def _resolve_cover(self):
         if not self._cover_candidate:
             return None
-        try:
-            self.source.read(self._cover_candidate)
-        except (KeyError, FileNotFoundError):
+        if not self.source.exists(self._cover_candidate):
+            warn(f'the book declares a cover image that is missing: {self._cover_candidate}')
             return None
         return self._cover_candidate
 
@@ -371,7 +459,11 @@ class Book:
             return {}, {}
         try:
             root = ET.fromstring(raw)
-        except ET.ParseError:
+        except ET.ParseError as exc:
+            warn(
+                f'META-INF/encryption.xml is not valid XML ({exc}); protected content, '
+                'if there is any, will not be detected and may show up as garbage'
+            )
             return {}, {}
         obfuscated, drm = {}, {}
         for ed in _find_descendants(root, 'EncryptedData', XML_ENC_NS_URI):
@@ -392,12 +484,26 @@ class Book:
     def is_drm(self, path):
         return path in self.drm_paths
 
+    def is_obfuscated(self, path):
+        return path in self.obfuscated_fonts
+
+    def exists(self, path):
+        return self.source.exists(path)
+
     def read_resource(self, path):
         if path in self.drm_paths:
             raise DrmProtectedError(path, self.drm_paths[path])
         raw = self.source.read(path)
         alg = self.obfuscated_fonts.get(path)
         return deobfuscate_font(raw, alg, self.identifier) if alg else raw
+
+    def open_resource(self, path):
+        """Open a resource for streaming: (file object, size, validator).
+
+        Not for obfuscated fonts, which have to be de-obfuscated in memory."""
+        if path in self.drm_paths:
+            raise DrmProtectedError(path, self.drm_paths[path])
+        return self.source.open(path)
 
     def _build_toc(self):
         if not self._toc_ref:
@@ -460,18 +566,26 @@ class Book:
                 entries.append(TocEntry(title or path or 'Untitled', path, frag, children))
         return entries
 
-    def _collect_titles(self):
-        titles = {}
-        for path in self.spine:
-            fallback = posixpath.splitext(posixpath.basename(path))[0]
+    def title_for(self, path, text=None):
+        """A chapter's title from its <title> or first <h1>, else its file name.
+
+        Looked up on first use and remembered, so starting the server never has to
+        read every chapter. Pass `text` if the chapter has already been decoded."""
+        cached = self._titles.get(path)
+        if cached is not None:
+            return cached
+        title = posixpath.splitext(posixpath.basename(path))[0]
+        if text is None:
             try:
                 text = sniff_text(self.read_resource(path))
-            except (KeyError, FileNotFoundError, DrmProtectedError):
-                titles[path] = fallback
-                continue
+            except (KeyError, FileNotFoundError, DrmProtectedError, ResourceTooLargeError):
+                text = None
+        if text is not None:
             m = first_real_match(TITLE_RE, text) or first_real_match(H1_RE, text)
-            titles[path] = html.unescape(TAG_RE.sub('', m.group(1))).strip() if m else fallback
-        return titles
+            if m:
+                title = html.unescape(TAG_RE.sub('', m.group(1))).strip()
+        self._titles[path] = title
+        return title
 
     def resolve(self, url_path):
         return posixpath.normpath(unquote(url_path).lstrip('/'))
@@ -509,7 +623,7 @@ def make_link(path, fragment=''):
     return url + ('#' + html.escape(fragment, quote=True) if fragment else '')
 
 
-def make_nav_bar(book, current_path):
+def make_nav_bar(book, current_path, text=None):
     idx = book.spine.index(current_path) if current_path in book.spine else -1
     prev = f'<a href="{make_link(book.spine[idx-1])}">&#8592; Prev</a>' if idx > 0 else ''
     nxt = (
@@ -517,7 +631,7 @@ def make_nav_bar(book, current_path):
         if 0 <= idx < len(book.spine) - 1
         else ''
     )
-    title = html.escape(book.titles.get(current_path, ''))
+    title = html.escape(book.title_for(current_path, text) if idx >= 0 else '')
     pos = f'{idx+1} / {len(book.spine)}' if idx >= 0 else ''
     middle = (
         f'<span class="mid"><span class="ch" title="{title}">{title}</span>'
@@ -554,7 +668,7 @@ def render_flat_list(book):
     return (
         '<ol>'
         + ''.join(
-            f'<li><a href="{make_link(p)}">{html.escape(book.titles.get(p, p))}</a>'
+            f'<li><a href="{make_link(p)}">{html.escape(book.title_for(p))}</a>'
             f'{_lock_badge(book, p)}</li>'
             for p in book.spine
         )
@@ -644,9 +758,70 @@ def is_wellformed_xhtml(text):
     return root.tag == f'{{{XHTML_NS_URI}}}html'
 
 
+def render_chapter(book, epub_path, raw):
+    """Prepare an HTML/XHTML chapter for serving: (body bytes, content type)."""
+    decoded = sniff_text(raw)
+    text, nav = XML_DECL_RE.sub('', decoded), make_nav_bar(book, epub_path, decoded)
+    body = first_real_match(BODY_OPEN_RE, text)
+    text = f'{text[: body.end()]}{nav}{text[body.end() :]}' if body else nav + text
+    # Well-formed XHTML is served as XML so the browser parses it the way the author
+    # intended; anything sloppy falls back to the forgiving HTML parser rather than
+    # showing an XML error page.
+    xml_text = numeric_entities(text)
+    if is_wellformed_xhtml(xml_text):
+        return xml_text.encode(), 'application/xhtml+xml; charset=utf-8'
+    return text.encode(), 'text/html; charset=utf-8'
+
+
+class ByteLRU:
+    """A small least-recently-used cache, bounded by the total size of what it holds."""
+
+    def __init__(self, max_bytes):
+        self.max_bytes = max_bytes
+        self._items = OrderedDict()  # key -> (value, size)
+        self._total = 0
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            entry = self._items.get(key)
+            if entry is None:
+                return None
+            self._items.move_to_end(key)
+            return entry[0]
+
+    def put(self, key, value, size):
+        if size > self.max_bytes // 4:  # one huge chapter shouldn't flush everything else
+            return
+        with self._lock:
+            old = self._items.pop(key, None)
+            if old is not None:
+                self._total -= old[1]
+            self._items[key] = (value, size)
+            self._total += size
+            while self._total > self.max_bytes:
+                _, (_, evicted_size) = self._items.popitem(last=False)
+                self._total -= evicted_size
+
+
+def etag_matches(header, etag):
+    """Whether an If-None-Match header means the client's copy is still current."""
+    if not header:
+        return False
+    if header.strip() == '*':
+        return True
+
+    def strip_weak(tag):
+        return tag[2:] if tag.startswith('W/') else tag
+
+    return any(strip_weak(tag.strip()) == strip_weak(etag) for tag in header.split(','))
+
+
 class ReaderHandler(BaseHTTPRequestHandler):
     book = None
     verbose = False
+    csp = None  # Content-Security-Policy to send with every response, if set
+    chapter_cache = None  # ByteLRU of processed chapters, if set
     _head_only = False
 
     def log_message(self, fmt, *args):
@@ -665,6 +840,8 @@ class ReaderHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             self._route()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the browser gave up on the request (closed the tab, seeked in a video, ...)
         except Exception as exc:
             traceback.print_exc()
             self._send(
@@ -693,56 +870,155 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 if self.book.opf_dir
                 else []
             )
-            found = None
-            for candidate in candidates:
-                try:
-                    self.book.read_resource(candidate)
-                except (KeyError, FileNotFoundError):
-                    continue
-                except DrmProtectedError:
-                    pass  # it exists; _serve_epub_file will send the DRM notice
-                found = candidate
-                break
+            # (A DRM-protected file still counts as found: _serve_epub_file explains why it
+            # can't be shown.)
+            found = next((c for c in candidates if self.book.exists(c)), None)
             if found is None:
                 self._send(404, b'Not found', 'text/plain; charset=utf-8')
             else:
                 self._serve_epub_file(found)
 
     def _serve_epub_file(self, epub_path):
+        lower = epub_path.lower()
+        is_text = lower.endswith(TEXT_DOC_EXTS) or lower.endswith('.css')
+        # Text is processed (nav bar, entities, charset), and obfuscated fonts are decoded,
+        # so both need the whole file in memory. Everything else - images, audio, video,
+        # plain fonts - is opened and, when it's big, streamed.
+        buffered = is_text or self.book.is_obfuscated(epub_path)
         try:
-            raw = self.book.read_resource(epub_path)
+            if buffered:
+                fetched = self.book.read_resource(epub_path)
+            else:
+                fetched = self.book.open_resource(epub_path)
         except DrmProtectedError:
             self._send(403, DRM_MESSAGE, 'text/plain; charset=utf-8')
             return
         except (KeyError, FileNotFoundError):
             self._send(404, f'Not found in EPUB: {epub_path}'.encode(), 'text/plain; charset=utf-8')
             return
-        lower = epub_path.lower()
-        if lower.endswith(('.xhtml', '.html', '.htm')):
-            text, nav = XML_DECL_RE.sub('', sniff_text(raw)), make_nav_bar(self.book, epub_path)
-            body = first_real_match(BODY_OPEN_RE, text)
-            text = f'{text[:body.end()]}{nav}{text[body.end():]}' if body else nav + text
-            # Well-formed XHTML is served as XML so the browser parses it the way the author
-            # intended; anything sloppy falls back to the forgiving HTML parser rather than
-            # showing an XML error page.
-            xml_text = numeric_entities(text)
-            if is_wellformed_xhtml(xml_text):
-                self._send(200, xml_text.encode(), 'application/xhtml+xml; charset=utf-8')
-            else:
-                self._send(200, text.encode(), 'text/html; charset=utf-8')
-        elif lower.endswith('.css'):
-            self._send(200, sniff_text(raw).encode(), 'text/css; charset=utf-8')
+        except ResourceTooLargeError as exc:
+            self._send(413, f'Too large to show: {exc}'.encode(), 'text/plain; charset=utf-8')
+            return
+        if buffered:
+            self._send_buffered(epub_path, lower, is_text, fetched)
         else:
-            ctype, _ = mimetypes.guess_type(lower)
-            self._send(200, raw, ctype or 'application/octet-stream')
+            self._send_opened(lower, *fetched)
 
-    def _send(self, status, body, ctype):
+    def _send_buffered(self, epub_path, lower, is_text, raw):
+        digest = hashlib.sha1(raw).hexdigest()[:20]
+        etag = f'"{ETAG_SALT}-{digest}"'
+        if self._not_modified(etag):
+            self._send_not_modified(etag)
+            return
+        if is_text:
+            body, ctype = self._rendered(epub_path, lower, raw, digest)
+        else:  # an obfuscated font, already de-obfuscated by the book
+            body, ctype = raw, mimetypes.guess_type(lower)[0] or 'application/octet-stream'
+        self._send(200, body, ctype, etag=etag)
+
+    def _rendered(self, epub_path, lower, raw, digest):
+        """The processed form of a chapter or stylesheet, from the cache when possible."""
+        key = (
+            epub_path,
+            digest,
+        )  # keyed on content, so an edited extracted folder never goes stale
+        cache = self.chapter_cache
+        result = cache.get(key) if cache is not None else None
+        if result is None:
+            if lower.endswith('.css'):
+                result = sniff_text(raw).encode(), 'text/css; charset=utf-8'
+            else:
+                result = render_chapter(self.book, epub_path, raw)
+            if cache is not None:
+                cache.put(key, result, len(result[0]))
+        return result
+
+    def _send_opened(self, lower, f, size, validator):
+        ctype = mimetypes.guess_type(lower)[0] or 'application/octet-stream'
+        etag = f'"{validator}"'
+        if ctype.startswith(('audio/', 'video/')) or size > STREAM_THRESHOLD:
+            self._send_stream(f, size, ctype, etag)
+            return
+        try:
+            if self._not_modified(etag):
+                self._send_not_modified(etag)
+                return
+            body = f.read()
+        finally:
+            f.close()
+        self._send(200, body, ctype, etag=etag)
+
+    def _not_modified(self, etag):
+        return etag_matches(self.headers.get('If-None-Match'), etag)
+
+    def _send_common_headers(self, etag=None, extra_headers=None):
+        if etag:
+            self.send_header('ETag', etag)
+            # Browsers may keep a copy but must check back first; the ETag makes that check
+            # a cheap 304 instead of a re-download, and edits to a folder show up at once.
+            self.send_header('Cache-Control', 'no-cache')
+        if self.csp:
+            self.send_header('Content-Security-Policy', self.csp)
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
+
+    def _send_not_modified(self, etag):
+        self.send_response(304)
+        self._send_common_headers(etag)
+        self.end_headers()
+
+    def _send(self, status, body, ctype, etag=None):
         self.send_response(status)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(body)))
+        self._send_common_headers(etag)
         self.end_headers()
         if not self._head_only:
             self.wfile.write(body)
+
+    def _send_stream(self, f, size, ctype, etag, extra_headers=None):
+        """Send an open file in chunks (closing it afterwards).
+
+        Supports Range, so browsers can seek in big PDFs, audio and video without
+        downloading the lot, plus If-Range and If-None-Match."""
+        with f:
+            if self._not_modified(etag):
+                self._send_not_modified(etag)
+                return
+            range_header, if_range = self.headers.get('Range'), self.headers.get('If-Range')
+            if range_header and if_range and if_range.strip() != etag:
+                range_header = None  # the file changed since the client's copy: send all of it
+            byte_range = parse_byte_range(range_header, size)
+            if byte_range is False:
+                self.send_response(416)
+                self.send_header('Content-Range', f'bytes */{size}')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            start, end = byte_range if byte_range else (0, size - 1)
+            length = max(end - start + 1, 0)
+            self.send_response(206 if byte_range else 200)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Content-Length', str(length))
+            if byte_range:
+                self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+            self._send_common_headers(etag, extra_headers)
+            self.end_headers()
+            if self._head_only:
+                return
+            f.seek(start)
+            remaining = length
+            try:
+                while remaining > 0:
+                    chunk = f.read(min(STREAM_CHUNK, remaining))
+                    if not chunk:  # file shrank mid-transfer: drop the connection rather than hang
+                        self.close_connection = True
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the browser closed the tab or seeked elsewhere
 
 
 # ---------------------------------------------------------------------------
@@ -750,7 +1026,6 @@ class ReaderHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 PDF_MAGIC = b'%PDF-'
-PDF_CHUNK = 64 * 1024
 PDF_URL_RE = re.compile(r'/(view|pdf|dl)/([0-9a-f]{12})')
 
 PDF_CSS = (
@@ -907,6 +1182,7 @@ def make_pdf_viewer_html(entry, show_back):
 
 class PdfHandler(ReaderHandler):
     library = None
+    csp = None  # PDFs are shown by the browser's own viewer; a script policy would get in its way
 
     def _route(self):
         path = unquote(self.path.split('?', 1)[0])
@@ -940,44 +1216,17 @@ class PdfHandler(ReaderHandler):
         except OSError:
             self._send(404, b'That PDF is no longer available', 'text/plain; charset=utf-8')
             return
-        with f:
-            size = os.fstat(f.fileno()).st_size
-            byte_range = parse_byte_range(self.headers.get('Range'), size)
-            if byte_range is False:
-                self.send_response(416)
-                self.send_header('Content-Range', f'bytes */{size}')
-                self.send_header('Content-Length', '0')
-                self.end_headers()
-                return
-            start, end = byte_range if byte_range else (0, size - 1)
-            length = max(end - start + 1, 0)
-            self.send_response(206 if byte_range else 200)
-            self.send_header('Content-Type', 'application/pdf')
-            self.send_header('Accept-Ranges', 'bytes')
-            self.send_header('Content-Length', str(length))
-            self.send_header(
-                'Content-Disposition', content_disposition(disposition, entry.path.name)
-            )
-            self.send_header('X-Content-Type-Options', 'nosniff')
-            if byte_range:
-                self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
-            self.end_headers()
-            if self._head_only:
-                return
-            f.seek(start)
-            remaining = length
-            try:
-                while remaining > 0:
-                    chunk = f.read(min(PDF_CHUNK, remaining))
-                    if (
-                        not chunk
-                    ):  # file shrank mid-transfer: drop the connection rather than hang the client
-                        self.close_connection = True
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                pass  # the browser closed the tab or seeked elsewhere
+        st = os.fstat(f.fileno())
+        self._send_stream(
+            f,
+            st.st_size,
+            'application/pdf',
+            f'"{st.st_mtime_ns:x}-{st.st_size:x}"',
+            {
+                'Content-Disposition': content_disposition(disposition, entry.path.name),
+                'X-Content-Type-Options': 'nosniff',
+            },
+        )
 
 
 def detect_mode(path):
@@ -1033,6 +1282,11 @@ def main():
         action='store_true',
         help='log every request (failed requests are always logged)',
     )
+    parser.add_argument(
+        '--allow-scripts',
+        action='store_true',
+        help='let EPUBs run their own JavaScript (blocked by default; only for books you trust)',
+    )
     args = parser.parse_args()
     src_path = Path(args.epub)
     if not src_path.exists():
@@ -1061,6 +1315,13 @@ def main():
         )
     ReaderHandler.book = book
     ReaderHandler.verbose = args.verbose
+    ReaderHandler.chapter_cache = ByteLRU(CHAPTER_CACHE_BYTES)
+    if args.allow_scripts:
+        print(
+            'warning: scripts inside the book are allowed to run - only do this for books you trust'
+        )
+    else:
+        ReaderHandler.csp = EPUB_CSP
     run_server(ReaderHandler, args.host, args.port, args.no_browser)
 
 
