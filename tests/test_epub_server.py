@@ -854,6 +854,7 @@ class BookParsingTests(TempDirCase):
         path = write_epub(
             self.tmp / 'epub2.epub',
             {
+                'mimetype': b'application/epub+zip',
                 'META-INF/container.xml': CONTAINER_XML.encode(),
                 'OEBPS/content.opf': make_opf(manifest, ['c1', 'c2'], ncx_id='ncx').encode(),
                 'OEBPS/toc.ncx': ncx.encode(),
@@ -872,6 +873,7 @@ class BookParsingTests(TempDirCase):
         path = write_epub(
             self.tmp / 'notoc.epub',
             {
+                'mimetype': b'application/epub+zip',
                 'META-INF/container.xml': CONTAINER_XML.encode(),
                 'OEBPS/content.opf': make_opf(manifest, ['c1', 'c2']).encode(),
                 'OEBPS/c1.xhtml': CHAPTER_1.encode(),
@@ -1135,6 +1137,164 @@ class PdfTests(TempDirCase):
 # ---------------------------------------------------------------------------
 # the real command line
 # ---------------------------------------------------------------------------
+
+
+class CompatibilityTests(TempDirCase):
+    """Things that are legal but unusual, or that this tool can't read, are reported plainly."""
+
+    def book_with(self, name, mutate):
+        files = main_epub_files()
+        mutate(files)
+        return load_book(write_epub(self.tmp / f'{name}.epub', files))
+
+    def opf(self, files, old, new):
+        files['OEBPS/content.opf'] = files['OEBPS/content.opf'].decode().replace(old, new).encode()
+
+    def test_a_tidy_book_produces_no_warnings(self):
+        _, err = self.book_with('tidy', lambda f: None)
+        self.assertEqual(err, '')
+
+    def test_missing_or_wrong_mimetype_file_warns(self):
+        _, err = self.book_with('nomime', lambda f: f.pop('mimetype'))
+        self.assertIn("no 'mimetype' file", err)
+        _, err = self.book_with('badmime', lambda f: f.update(mimetype=b'text/plain'))
+        self.assertIn('does not say application/epub+zip', err)
+
+    def test_unknown_or_missing_package_version_warns(self):
+        _, err = self.book_with('v9', lambda f: self.opf(f, 'version="3.0"', 'version="9.1"'))
+        self.assertIn('EPUB version 9.1 is not one this tool knows', err)
+        _, err = self.book_with('v0', lambda f: self.opf(f, ' version="3.0"', ''))
+        self.assertIn('declares no EPUB version', err)
+        _, err = self.book_with('v2', lambda f: self.opf(f, 'version="3.0"', 'version="2.0"'))
+        self.assertEqual(err, '')
+
+    def test_fixed_layout_book_warns(self):
+        meta = '<meta property="rendition:layout">pre-paginated</meta>'
+        _, err = self.book_with('fxl', lambda f: self.opf(f, '</metadata>', meta + '</metadata>'))
+        self.assertIn('fixed-layout', err)
+
+    def test_non_html_reading_order_items_are_reported_once(self):
+        def mutate(files):
+            self.opf(
+                files, '<itemref idref="c1"/>', '<itemref idref="cover"/><itemref idref="c1"/>'
+            )
+
+        book, err = self.book_with('imgspine', mutate)
+        self.assertEqual(err.count('not HTML pages'), 1)
+        self.assertIn('img/cover.png', err)
+
+    def test_password_protected_zip_entries_are_reported_not_crashed(self):
+        entry = zipfile.ZipInfo('OEBPS/c1.xhtml')
+        entry.flag_bits |= 0x1
+        book, _ = load_book(write_epub(self.tmp / 'zipenc.epub', main_epub_files()))
+        zf = book.source._zf
+        info = zf.getinfo('OEBPS/c1.xhtml')
+        info.flag_bits |= 0x1  # pretend the entry is encrypted
+        with self.assertRaises(es.UnsupportedContentError):
+            book.source.read('OEBPS/c1.xhtml')
+        srv = Running(quiet_handler(es.ReaderHandler, book=book, csp=es.build_csp()))
+        self.addCleanup(srv.close)
+        r = srv.get('/book/OEBPS/c1.xhtml')
+        self.assertEqual(r.status, 415)
+        self.assertIn(b'password-protected', r.body)
+        info.flag_bits &= ~0x1
+
+    def test_unsupported_zip_compression_is_reported(self):
+        book, _ = load_book(write_epub(self.tmp / 'zipcomp.epub', main_epub_files()))
+        info = book.source._zf.getinfo('OEBPS/c1.xhtml')
+        info.compress_type = 99  # not a method the zip library knows
+        with self.assertRaisesRegex(es.UnsupportedContentError, 'compression'):
+            book.source.read('OEBPS/c1.xhtml')
+
+    def test_foreign_formats_are_recognised_by_their_first_bytes(self):
+        cases = {
+            'a.mobi': (b'x' * 60 + b'BOOKMOBI' + b'x' * 20, 'Kindle'),
+            'a.rar': (b'Rar!\x1a\x07\x00', 'archive'),
+            'a.chm': (b'ITSF\x03\x00', 'CHM'),
+            'a.fb2': (b'<?xml version="1.0"?><FictionBook>', 'FB2'),
+            'a.txt': (b'hello', None),
+        }
+        for name, (data, expected) in cases.items():
+            path = self.tmp / name
+            path.write_bytes(data)
+            found = es.foreign_format(path)
+            if expected is None:
+                self.assertIsNone(found, name)
+            else:
+                self.assertIn(expected, found, name)
+
+    def test_command_line_explains_unreadable_inputs(self):
+        junk = self.tmp / 'junk.epub'
+        junk.write_bytes(b'this is not a zip file at all')
+        mobi = self.tmp / 'book.epub'
+        mobi.write_bytes(b'x' * 60 + b'BOOKMOBI' + b'x' * 100)
+        for path, expected in ((junk, 'not a readable zip file'), (mobi, 'Kindle/Mobipocket')):
+            r = run_script(str(path), '--no-browser')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn(expected, r.stderr)
+            self.assertNotIn('Traceback', r.stderr)
+
+    def test_port_must_be_a_real_port(self):
+        for bad in ('0', '70000', 'abc', '-5'):
+            r = run_script(str(self.tmp / 'junk.epub'), '--port', bad, '--no-browser')
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertIn('port', r.stderr)
+        self.assertEqual(es.port_number('8080'), 8080)
+
+    def test_ipv6_loopback_is_served_when_the_machine_supports_it(self):
+        if not socket.has_ipv6:
+            self.skipTest('no IPv6 here')
+        epub = write_epub(self.tmp / 'v6.epub', main_epub_files())
+        port = free_port()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                '-I',
+                str(SCRIPT),
+                str(epub),
+                '--host',
+                '::1',
+                '--port',
+                str(port),
+                '--no-browser',
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            for _ in range(50):
+                try:
+                    socket.create_connection(('::1', port), 0.2).close()
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                self.skipTest('could not use ::1 in this environment')
+            conn = HTTPConnection('::1', port, timeout=5)
+            conn.request('GET', '/', headers={'Host': f'[::1]:{port}'})
+            self.assertEqual(conn.getresponse().status, 200)
+        finally:
+            proc.terminate()
+            out, err = proc.communicate(timeout=5)
+        self.assertIn(f'http://[::1]:{port}/', out)
+
+    def test_unusable_listen_addresses_get_a_plain_explanation(self):
+        epub = write_epub(self.tmp / 'badhost.epub', main_epub_files())
+        for host, expected in (
+            ('203.0.113.7', 'cannot listen on'),
+            ('no such host', 'not an address'),
+        ):
+            r = run_script(str(epub), '--host', host, '--port', str(free_port()))
+            self.assertNotEqual(r.returncode, 0, host)
+            self.assertIn(expected, r.stderr, host)
+            self.assertNotIn('Traceback', r.stderr, host)
+
+    def test_old_python_gets_a_clear_message(self):
+        source = SCRIPT.read_text()
+        head = source.split('import argparse')[0]
+        self.assertIn('needs Python 3.7 or newer', head)
+        self.assertLess(head.index('sys.version_info'), source.index('import argparse'))
 
 
 class CachePoisoningTests(TempDirCase):

@@ -70,6 +70,17 @@ single `.pdf`, or a whole folder of them.
 - **Loud, not silent** — problems such as an unreadable `encryption.xml` or a
   broken table of contents print a warning on stderr instead of being ignored.
 
+- **Compatibility checks, in plain words** — instead of a traceback, you get a
+  clear message (and the book still opens where it can) for: a Python older
+  than 3.7; a file that isn't a readable zip (with a hint if it is really a
+  Kindle/MOBI, CHM, FB2, DjVu or archive file); password-protected or
+  unsupported-compression zip entries (shown as `415 Cannot be shown`);
+  missing or wrong `mimetype` file; unknown or missing EPUB version;
+  fixed-layout books; reading-order items that are images/SVG rather than
+  HTML; invalid `--port` values; and listen addresses this machine can't use.
+  IPv6 addresses such as `--host ::1` are supported. Non-ASCII titles never
+  crash a console that can't display them.
+
 ## Requirements
 
 - Python 3.7 or later.

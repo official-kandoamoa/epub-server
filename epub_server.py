@@ -35,7 +35,17 @@ Usage:
     python epub_server.py ./folder-of-pdfs
 """
 
+import sys
+
+if sys.version_info < (3, 7):  # checked before anything newer than 3.6 is imported or used
+    sys.exit(
+        'error: epub_server.py needs Python 3.7 or newer '
+        f'(this is {sys.version_info[0]}.{sys.version_info[1]}). Install a newer Python and run '
+        'it with that, e.g. "python3.11 epub_server.py book.epub".'
+    )
+
 import argparse
+import errno
 import hashlib
 import html
 import html.entities as html_entities
@@ -44,7 +54,6 @@ import os
 import posixpath
 import re
 import stat
-import sys
 import threading
 import traceback
 import unicodedata
@@ -178,6 +187,15 @@ class ResourceTooLargeError(Exception):
         self.name, self.size, self.limit = name, size, limit
 
 
+class UnsupportedContentError(Exception):
+    """An entry this tool can't read (a password-protected zip entry, an unsupported
+    compression method), as opposed to one that is missing or DRM-protected."""
+
+    def __init__(self, name, reason):
+        super().__init__(f'{name}: {reason}')
+        self.name, self.reason = name, reason
+
+
 def _check_size(name, size):
     if size > MAX_INMEMORY_BYTES:
         raise ResourceTooLargeError(name, size, MAX_INMEMORY_BYTES)
@@ -217,12 +235,22 @@ class ZipSource:
                 return False
             return True
 
+    @staticmethod
+    def _unsupported(name, exc):
+        """The error for an entry the zip library can't open, in plain words."""
+        if isinstance(exc, NotImplementedError):
+            return UnsupportedContentError(name, f'unsupported zip compression ({exc})')
+        return UnsupportedContentError(name, 'password-protected zip entry')
+
     def read(self, name):
         """The whole entry as bytes (refuses entries bigger than MAX_INMEMORY_BYTES)."""
         with self._lock:
             info = self._resolve(name)
             _check_size(name, info.file_size)
-            return self._zf.read(info)
+            try:
+                return self._zf.read(info)
+            except (NotImplementedError, RuntimeError) as exc:  # RuntimeError: encrypted
+                raise self._unsupported(name, exc) from exc
 
     def open(self, name):
         """Open an entry for streaming: (file object, size, validator).
@@ -231,7 +259,10 @@ class ZipSource:
         validator changes whenever the entry's content does (used for ETags)."""
         with self._lock:
             info = self._resolve(name)
-            f = self._zf.open(info)
+            try:
+                f = self._zf.open(info)
+            except (NotImplementedError, RuntimeError) as exc:
+                raise self._unsupported(name, exc) from exc
         return f, info.file_size, f'{info.CRC:08x}-{info.file_size:x}'
 
     def canonical(self, name):
@@ -559,6 +590,8 @@ class Book:
     def __init__(self, source):
         self.source = source
         self.opf_dir, self.opf_path = self._find_opf()
+        if self.opf_path is not None:  # a loose folder of pages was never meant to be an EPUB
+            self._check_mimetype_entry()
         if self.opf_path is None:
             self._parse_loose_pages()
         else:
@@ -609,6 +642,54 @@ class Book:
         full_path = candidates[0]
         warn(f'{problem}; using {full_path} instead')
         return posixpath.dirname(full_path), full_path
+
+    def _check_mimetype_entry(self):
+        """Some readers refuse an EPUB whose 'mimetype' entry is missing or wrong; this one
+        doesn't, but the book's author would want to know."""
+        try:
+            declared = self.source.read('mimetype').strip()
+        except (KeyError, FileNotFoundError, UnsupportedContentError, ResourceTooLargeError):
+            warn("the book has no 'mimetype' file; strict EPUB readers may refuse it")
+            return
+        if declared != b'application/epub+zip':
+            warn(
+                "the book's 'mimetype' file does not say application/epub+zip; strict readers may refuse it"
+            )
+
+    def _check_package_compatibility(self, root, manifest, spine):
+        """Warn about things that are legal but won't look or work as the author intended here."""
+        version = (root.get('version') or '').strip()
+        if not version:
+            warn('the package file declares no EPUB version; assuming it is EPUB 2 or 3')
+        elif version.split('.')[0] not in ('2', '3'):
+            warn(
+                f'EPUB version {version} is not one this tool knows (2.x and 3.x); '
+                'some features may not display'
+            )
+        for meta in root.findall('.//opf:metadata/opf:meta', OPF_NS):
+            if (
+                meta.get('property') == 'rendition:layout'
+                and (meta.text or '').strip() == 'pre-paginated'
+            ):
+                warn(
+                    'this is a fixed-layout book: pages are positioned exactly, so the reading '
+                    'bar may overlap content and text may not reflow'
+                )
+                break
+        by_path = {mi.href: mi for mi in manifest.values()}
+        odd = [
+            p
+            for p in spine
+            if by_path.get(p)
+            and not by_path[p].media_type.startswith(
+                ('application/xhtml', 'text/html', 'text/x-oeb1-document', 'application/x-dtbook')
+            )
+        ]
+        if odd:
+            warn(
+                f'{len(odd)} reading-order item(s) are not HTML pages (images or SVG, for '
+                f'example, such as {odd[0]}); they are served as they are, without the reading bar'
+            )
 
     def _parse_loose_pages(self):
         """No package file at all: serve every .html/.htm/.xhtml file, sorted by name.
@@ -689,6 +770,7 @@ class Book:
                 mi = manifest.get(meta_cover.get('content', ''))
                 if mi:
                     cover = mi.href
+        self._check_package_compatibility(root, manifest, spine)
         self.title = titles[0] if titles else 'Untitled'
         self.authors, self.language, self.identifier = (
             texts('creator'),
@@ -863,6 +945,7 @@ class Book:
                 FileNotFoundError,
                 DrmProtectedError,
                 ResourceTooLargeError,
+                UnsupportedContentError,
                 zipfile.BadZipFile,
                 zlib.error,
             ):
@@ -1251,6 +1334,9 @@ class ReaderHandler(BaseHTTPRequestHandler):
         except ResourceTooLargeError as exc:
             self._send(413, f'Too large to show: {exc}'.encode(), 'text/plain; charset=utf-8')
             return
+        except UnsupportedContentError as exc:
+            self._send(415, f'Cannot be shown: {exc}'.encode(), 'text/plain; charset=utf-8')
+            return
         if buffered:
             self._send_buffered(epub_path, lower, is_text, fetched)
         else:
@@ -1623,6 +1709,26 @@ class PdfHandler(ReaderHandler):
         )
 
 
+def foreign_format(path):
+    """The name of a well-known non-EPUB format this file is in, judged by its first bytes."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(70)
+    except OSError:
+        return None
+    if head[60:68] in (b'BOOKMOBI', b'TEXtREAd'):
+        return 'a Kindle/Mobipocket (MOBI/AZW) book'
+    if head.startswith(b'ITSF'):
+        return 'a CHM help file'
+    if head.startswith(b'AT&TFORM'):
+        return 'a DjVu document'
+    if head.startswith((b'Rar!', b'7z\xbc\xaf', b'\x1f\x8b')):
+        return 'a compressed archive (extract it first, then point this at the folder)'
+    if head.lstrip().startswith(b'<?xml') and b'FictionBook' in head:
+        return 'an FB2 book'
+    return None
+
+
 def detect_mode(path):
     """'pdf' for a PDF file or a folder of PDFs, otherwise 'epub'."""
     if path.is_file():
@@ -1645,13 +1751,28 @@ def run_server(handler, host, port, no_browser):
             'can read everything being served'
         )
     try:
-        server = QuietThreadingHTTPServer((host, port), handler)
+        server_class = QuietThreadingHTTPServer
+        if ':' in host:  # an IPv6 address such as ::1
+            server_class = type(
+                'QuietThreadingHTTPServerV6',
+                (QuietThreadingHTTPServer,),
+                {'address_family': socket.AF_INET6},
+            )
+        server = server_class((host, port), handler)
+    except socket.gaierror as exc:
+        sys.exit(f'error: {host!r} is not an address this machine can listen on ({exc.strerror})')
     except OSError as exc:
+        if exc.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+            sys.exit(
+                f'error: this machine cannot listen on {host} ({exc.strerror or exc}). '
+                'Is it an address this machine has (IPv6 may be switched off)? '
+                'Try 127.0.0.1, or 0.0.0.0 for every IPv4 interface.'
+            )
         sys.exit(
             f'error: could not listen on {host}:{port} ({exc.strerror or exc}). '
             'Is another copy already running? Try a different --port.'
         )
-    url = f'http://{host}:{port}/'
+    url = f'http://[{host}]:{port}/' if ':' in host else f'http://{host}:{port}/'
     print(f'serving at {url}  (Ctrl+C to stop)')
     if not no_browser:
         try:
@@ -1664,6 +1785,17 @@ def run_server(handler, host, port, no_browser):
         print('\nstopped')
 
 
+def port_number(text):
+    """argparse type: a TCP port, 1-65535."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'{text!r} is not a number') from None
+    if not 1 <= value <= 65535:
+        raise argparse.ArgumentTypeError(f'{value} is not a valid port (use 1-65535)')
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1673,7 +1805,7 @@ def main():
         metavar='path',
         help='.epub or .pdf file, or a folder: either extracted epub contents or PDFs to host',
     )
-    parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--port', type=port_number, default=8000)
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument(
         '--no-browser', action='store_true', help="don't try to auto-open a browser tab"
@@ -1695,6 +1827,13 @@ def main():
         '(blocked by default, so a book cannot phone home while you read it)',
     )
     args = parser.parse_args()
+    for stream in (sys.stdout, sys.stderr):
+        # A Windows console in a legacy code page would crash on a title with, say, CJK
+        # characters; show a replacement mark instead.
+        try:
+            stream.reconfigure(errors='replace')
+        except (AttributeError, ValueError):
+            pass
     src_path = Path(args.epub)
     if not src_path.exists():
         sys.exit(f'error: {src_path} not found')
@@ -1708,6 +1847,22 @@ def main():
         return
     try:
         book = Book(open_source(src_path))
+    except zipfile.BadZipFile as exc:
+        other = foreign_format(src_path) if src_path.is_file() else None
+        sys.exit(
+            f'error: {src_path} is not an EPUB'
+            + (
+                f': it looks like {other}. Convert it to EPUB first.'
+                if other
+                else f' - it is not a readable zip file ({exc}). Is the download incomplete?'
+            )
+        )
+    except PermissionError:
+        sys.exit(f'error: no permission to read {src_path}')
+    except (NotImplementedError, UnsupportedContentError) as exc:
+        sys.exit(f'error: this EPUB uses a zip feature that is not supported: {exc}')
+    except OSError as exc:
+        sys.exit(f'error: could not read {src_path}: {exc.strerror or exc}')
     except Exception as exc:
         sys.exit(f'error: could not parse EPUB structure: {exc}')
     print(f'"{book.title}"' + (f' by {", ".join(book.authors)}' if book.authors else ''))
