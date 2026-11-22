@@ -945,6 +945,16 @@ def render_chapter(book, epub_path, raw):
     return text.encode(), 'text/html; charset=utf-8'
 
 
+class QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """Threading server that doesn't print a traceback each time a client hangs up."""
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return
+        print(f'warning: error while handling a request: {printable(repr(exc))}', file=sys.stderr)
+
+
 class ByteLRU:
     """A small least-recently-used cache, bounded by the total size of what it holds."""
 
@@ -1489,7 +1499,7 @@ def run_server(handler, host, port, no_browser):
             'can read everything being served'
         )
     try:
-        server = ThreadingHTTPServer((host, port), handler)
+        server = QuietThreadingHTTPServer((host, port), handler)
     except OSError as exc:
         sys.exit(
             f'error: could not listen on {host}:{port} ({exc.strerror or exc}). '

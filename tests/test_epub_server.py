@@ -20,7 +20,6 @@ import unicodedata
 import unittest
 import zipfile
 from http.client import HTTPConnection
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -48,7 +47,7 @@ class Running:
     """A real HTTP server on a free port, running in a background thread."""
 
     def __init__(self, handler):
-        self.server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        self.server = es.QuietThreadingHTTPServer(('127.0.0.1', 0), handler)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -1135,6 +1134,102 @@ class PdfTests(TempDirCase):
 # ---------------------------------------------------------------------------
 # the real command line
 # ---------------------------------------------------------------------------
+
+
+class CachePoisoningTests(TempDirCase):
+    """Nothing in a request may change what another request gets from the cache."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.book, _ = load_book(write_epub(cls.tmp / 'cp.epub', main_epub_files()))
+        cls.srv = Running(
+            quiet_handler(
+                es.ReaderHandler,
+                book=cls.book,
+                csp=es.EPUB_CSP,
+                chapter_cache=es.ByteLRU(es.CHAPTER_CACHE_BYTES),
+                allowed_hosts=es.allowed_host_names('127.0.0.1'),
+            )
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.close()
+        super().tearDownClass()
+
+    def test_request_headers_and_query_never_change_the_body(self):
+        url = '/book/OEBPS/c1.xhtml'
+        expected = self.srv.get(url)
+        variants = [
+            (url, {'X-Forwarded-Host': 'evil.example'}),
+            (url, {'X-Original-URL': '/other'}),
+            (url, {'Cookie': 'a=b', 'Accept-Language': 'zz'}),
+            (url, {'User-Agent': '<script>alert(1)</script>'}),
+            (url + '?x=<script>', {}),
+            (url + '?a=1&a=2', {}),
+            (url, {'Range': 'bytes=0-5'}),
+        ]
+        for path, headers in variants:
+            r = self.srv.get(path, headers)
+            self.assertEqual(r.body, expected.body, (path, headers))
+            self.assertEqual(r.headers['etag'], expected.headers['etag'])
+            self.assertNotIn(b'evil.example', r.body)
+
+    def test_responses_must_be_revalidated_and_never_reflect_input(self):
+        r = self.srv.get('/book/OEBPS/c1.xhtml')
+        self.assertEqual(r.headers['cache-control'], 'no-cache')
+        self.assertNotIn('vary', r.headers)
+
+    def test_wrong_etag_never_yields_a_stale_304(self):
+        url = '/book/OEBPS/c1.xhtml'
+        good = self.srv.get(url).headers['etag']
+        self.assertEqual(self.srv.get(url, {'If-None-Match': good}).status, 304)
+        self.assertEqual(self.srv.get(url, {'If-None-Match': '"nope"'}).status, 200)
+        # an ETag from one file must not validate another
+        self.assertEqual(self.srv.get('/book/OEBPS/c2.xhtml', {'If-None-Match': good}).status, 200)
+
+    def test_concurrent_requests_all_get_identical_bodies(self):
+        url = '/book/OEBPS/c1.xhtml'
+        expected = self.srv.get(url).body
+        bad = []
+
+        def worker():
+            for _ in range(25):
+                if self.srv.get(url).body != expected:
+                    bad.append(1)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(bad, [])
+
+    def test_path_tricks_never_reach_other_content(self):
+        for path in (
+            '/book/../../etc/passwd',
+            '/book/%2e%2e/%2e%2e/etc/passwd',
+            '/book/OEBPS/..%2f..%2fMETA-INF/container.xml',
+            '/book/OEBPS/c1.xhtml%00.png',
+            '/book/OEBPS\\c1.xhtml',
+        ):
+            self.assertEqual(self.srv.get(path).status, 404, path)
+        for path in (
+            '/book/OEBPS/./drm.xhtml',
+            '/book/OEBPS/x/../drm.xhtml',
+            '/book/OEBPS/%64rm.xhtml',
+        ):
+            self.assertEqual(self.srv.get(path).status, 403, path)
+
+    def test_oversized_and_excessive_headers_are_rejected(self):
+        for raw, code in (
+            (b'GET / HTTP/1.1\r\nHost: localhost\r\nX: ' + b'a' * 70000 + b'\r\n\r\n', b'431'),
+            (b'GET / HTTP/1.1\r\nHost: localhost\r\n' + b'H: 1\r\n' * 150 + b'\r\n', b'431'),
+        ):
+            with socket.create_connection(('127.0.0.1', self.srv.port), timeout=5) as s:
+                s.sendall(raw)
+                self.assertIn(code, s.recv(100))
 
 
 class HardeningTests(TempDirCase):
