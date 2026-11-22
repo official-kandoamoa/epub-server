@@ -899,7 +899,7 @@ class BookParsingTests(TempDirCase):
     def test_not_an_epub_is_a_clean_error(self):
         path = self.tmp / 'junk.epub'
         write_epub(path, {'hello.txt': b'hi'})
-        with self.assertRaises(KeyError):
+        with self.assertRaisesRegex(ValueError, 'no .opf package file was found'):
             es.Book(es.open_source(path))
 
 
@@ -1253,15 +1253,83 @@ class ReviewFollowUpTests(TempDirCase):
         walk(book.toc)
         self.assertEqual(flat, ['Ch 1', 'Sec 1.1'])
 
-    def test_rootfile_without_full_path_is_a_clear_error(self):
+    def _book_with_container(self, name, container, drop=(), as_folder=False):
         files = main_epub_files()
-        files['META-INF/container.xml'] = (
-            b'<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
-            b'<rootfiles><rootfile media-type="x"/></rootfiles></container>'
+        files.pop('META-INF/container.xml')
+        if container is not None:
+            files['META-INF/container.xml'] = container
+        for d in drop:
+            files.pop(d)
+        if as_folder:
+            folder = self.tmp / name
+            for n, data in files.items():
+                target = folder / n
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            return load_book(folder)
+        return load_book(write_epub(self.tmp / f'{name}.epub', files))
+
+    CONTAINER_HEAD = (
+        b'<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
+    )
+
+    def test_missing_container_xml_falls_back_to_finding_the_opf(self):
+        for as_folder in (False, True):
+            book, err = self._book_with_container(f'nocont{as_folder}', None, as_folder=as_folder)
+            self.assertEqual(book.opf_path, 'OEBPS/content.opf')
+            self.assertEqual(book.title, 'Test Book')
+            self.assertIn('container.xml is missing', err)
+            self.assertIn('using OEBPS/content.opf', err)
+
+    def test_container_pointing_at_a_missing_file_falls_back(self):
+        bad = self.CONTAINER_HEAD + b'<rootfile full-path="nope/gone.opf"/></rootfiles></container>'
+        book, err = self._book_with_container('ghost', bad)
+        self.assertEqual(book.opf_path, 'OEBPS/content.opf')
+        self.assertIn('does not point to a package file that exists', err)
+
+    def test_rootfile_without_full_path_or_broken_container_falls_back(self):
+        for name, data in (
+            ('nofp', self.CONTAINER_HEAD + b'<rootfile media-type="x"/></rootfiles></container>'),
+            ('empty', self.CONTAINER_HEAD + b'</rootfiles></container>'),
+            ('garbage', b'<container><unclosed>'),
+        ):
+            book, err = self._book_with_container(name, data)
+            self.assertEqual(book.opf_path, 'OEBPS/content.opf', name)
+            self.assertIn('using OEBPS/content.opf', err, name)
+
+    def test_a_later_valid_rootfile_is_used_before_any_search(self):
+        two = (
+            self.CONTAINER_HEAD
+            + b'<rootfile full-path="nope.opf"/><rootfile full-path="OEBPS/content.opf"/>'
+            + b'</rootfiles></container>'
         )
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaisesRegex(ValueError, 'full-path'):
-                es.Book(es.open_source(write_epub(self.tmp / 'nofp.epub', files)))
+        book, err = self._book_with_container('two', two)
+        self.assertEqual(book.opf_path, 'OEBPS/content.opf')
+        self.assertEqual(err, '')
+
+    def test_no_opf_anywhere_means_not_an_epub(self):
+        for as_folder in (False, True):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(ValueError, 'no .opf package file was found'):
+                    self._book_with_container(
+                        f'noopf{as_folder}', None, drop=('OEBPS/content.opf',), as_folder=as_folder
+                    )
+
+    def test_opf_search_prefers_the_shallowest_and_skips_hidden_folders(self):
+        folder = self.tmp / 'search'
+        (folder / '.hidden').mkdir(parents=True)
+        (folder / '.hidden' / 'a.opf').write_text('x')
+        (folder / 'deep' / 'er').mkdir(parents=True)
+        (folder / 'deep' / 'er' / 'z.opf').write_text('x')
+        (folder / 'deep' / 'm.OPF').write_text('x')
+        self.assertEqual(es.DirSource(folder).find_opf_names(), ['deep/m.OPF', 'deep/er/z.opf'])
+
+    def test_folder_with_pdfs_and_an_opf_is_still_an_epub(self):
+        folder = self.tmp / 'mixed'
+        (folder / 'OEBPS').mkdir(parents=True)
+        (folder / 'OEBPS' / 'content.opf').write_text('x')
+        (folder / 'a.pdf').write_bytes(b'%PDF-1.4 x')
+        self.assertEqual(es.detect_mode(folder), 'epub')
 
     def test_blank_title_falls_back_to_h1_and_corrupt_chapter_to_filename(self):
         files = main_epub_files()

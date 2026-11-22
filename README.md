@@ -21,6 +21,7 @@ single `.pdf`, or a whole folder of them.
 - **Correct Unicode, always** — accented characters, CJK, emoji, and curly
   quotes decode correctly no matter what encoding the original files
   declared, including CSS `@charset` and legacy non-UTF-8 encodings.
+- **Finds the book even if `container.xml` is wrong** — if `META-INF/container.xml` is missing, broken, or points at a file that doesn't exist, it searches for an `.opf` package file itself (shallowest first, with a warning); if there is none, it reports that this is not a valid EPUB.
 - **Handles messy real-world zips** — percent-encoded filenames, filenames
   with a different Unicode normalization than the metadata expects (NFC vs
   NFD, common from macOS), and legacy CP437-mangled filenames.

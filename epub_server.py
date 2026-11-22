@@ -243,6 +243,12 @@ class ZipSource:
             except KeyError:
                 return name
 
+    def find_opf_names(self):
+        """Every .opf entry, shallowest first (the fallback when container.xml is no help)."""
+        with self._lock:
+            names = [n for n in self._zf.namelist() if n.lower().endswith('.opf')]
+        return sorted(names, key=lambda n: (n.count('/'), n.lower()))
+
     def _find_alt_name(self, name):
         alt = self._by_nfc.get(unicodedata.normalize('NFC', name))
         if alt is not None:
@@ -302,6 +308,21 @@ class DirSource:
         except OSError as exc:
             raise FileNotFoundError(name) from exc
         return f, st.st_size, f'{st.st_mtime_ns:x}-{st.st_size:x}'
+
+    def find_opf_names(self, limit=20000):
+        """Every .opf file in the folder (hidden folders skipped), shallowest first."""
+        found, seen = [], 0
+        for dirpath, dirnames, filenames in os.walk(self._root):
+            dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+            for f in filenames:
+                seen += 1
+                if f.lower().endswith('.opf') and not f.startswith('.'):
+                    rel = Path(dirpath, f).relative_to(self._root).as_posix()
+                    if self.exists(rel):  # regular file inside the root, not a symlink escape
+                        found.append(rel)
+            if seen > limit:
+                break
+        return sorted(found, key=lambda n: (n.count('/'), n.lower()))
 
     @staticmethod
     def canonical(name):
@@ -527,13 +548,32 @@ class Book:
             self.toc = []
 
     def _find_opf(self):
-        root = parse_xml(self.source.read('META-INF/container.xml'))
-        rootfile = root.find('.//c:rootfile', CONTAINER_NS)
-        if rootfile is None:
-            raise ValueError('container.xml has no <rootfile> - not a valid EPUB')
-        if not rootfile.get('full-path'):
-            raise ValueError('container.xml <rootfile> has no full-path - not a valid EPUB')
-        full_path, _ = resolve_href(rootfile.get('full-path'), '')
+        """Where the package (.opf) file is: (its folder, its path).
+
+        container.xml is the proper source. If it is missing, unreadable, or points at a
+        file that isn't there, look for an .opf file directly (and say so). If there is
+        none at all, this isn't a usable book."""
+        problem = None
+        try:
+            root = parse_xml(self.source.read('META-INF/container.xml'))
+        except (KeyError, FileNotFoundError):
+            problem = 'META-INF/container.xml is missing'
+        except Exception as exc:  # unparseable, too large, entity declarations...
+            problem = f'META-INF/container.xml is unusable ({printable(str(exc))})'
+        else:
+            for rootfile in root.findall('.//c:rootfile', CONTAINER_NS):
+                href = rootfile.get('full-path')
+                if not href:
+                    continue
+                full_path, _ = resolve_href(href, '')
+                if self.source.exists(full_path):
+                    return posixpath.dirname(full_path), full_path
+            problem = 'META-INF/container.xml does not point to a package file that exists'
+        candidates = self.source.find_opf_names()
+        if not candidates:
+            raise ValueError(f'{problem}, and no .opf package file was found - not a valid EPUB')
+        full_path = candidates[0]
+        warn(f'{problem}; using {full_path} instead')
         return posixpath.dirname(full_path), full_path
 
     def _parse_opf(self):
@@ -1517,6 +1557,7 @@ def detect_mode(path):
     if (
         path.is_dir()
         and not (path / 'META-INF' / 'container.xml').is_file()
+        and not DirSource(path).find_opf_names()
         and PdfLibrary(path).scan()
     ):
         return 'pdf'
