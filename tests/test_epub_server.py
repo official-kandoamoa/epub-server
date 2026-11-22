@@ -1446,7 +1446,7 @@ class ReviewFollowUpTests(TempDirCase):
     def test_log_line_survives_a_request_that_never_got_its_headers_parsed(self):
         handler = quiet_handler(es.ReaderHandler, book=None)
         h = handler.__new__(handler)  # no .headers, as after a malformed request line
-        h.verbose, h.command, h.path = False, None, '/'
+        h.verbose, h.command = False, None  # no .path either
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             es.ReaderHandler.log_request(h, 400)

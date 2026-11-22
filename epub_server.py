@@ -1154,7 +1154,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             failed = False
         if self.verbose or failed:
-            line = f'{code} {printable(self.command)} {printable(self.path)}'
+            line = f'{code} {printable(self.command)} {printable(getattr(self, "path", None))}'
             source = self._referring_page() if failed else None
             if source:
                 line += f'  (requested by {source})'
