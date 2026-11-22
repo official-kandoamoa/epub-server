@@ -1542,7 +1542,7 @@ class CommandLineTests(TempDirCase):
         finally:
             out, err = cli.stop()
         self.assertIn('"Test Book" by Ann Author, Bob Writer', out)
-        self.assertIn('DRM-protected', out)
+        self.assertIn('DRM-protected', err)
         self.assertNotIn('Traceback', err)
 
     def test_pdf_mode_startup_message(self):
