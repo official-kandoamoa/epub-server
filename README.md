@@ -1,9 +1,18 @@
 # EPUB Server
 
 A single-file, dependency-free Python script that serves an `.epub` file as a
-local website, so you can read it in any browser.
+local website, so you can read it in any browser. It can also host PDFs: a
+single `.pdf`, or a whole folder of them.
 
 ## Features
+
+- **PDF hosting** — point it at a `.pdf` for an in-browser viewer page, or at a
+  folder of PDFs (searched recursively) for a library page listing every file
+  with its size, a viewer, and a download link. PDFs are streamed straight from
+  disk with HTTP Range support, so large files open quickly and the browser
+  can jump to any page without downloading the whole thing first. The folder is
+  rescanned on every page load, so PDFs you add while the server is running
+  appear on reload. See [Hosting PDFs](#hosting-pdfs).
 
 - **Zero dependencies** — standard library only, works anywhere Python 3
   runs, including Termux on Android.
@@ -45,6 +54,19 @@ local website, so you can read it in any browser.
 - **In-page reading nav bar** — contents / prev / next / chapter title /
   position — injected into each chapter.
 
+- **Safe by default with untrusted books** — a book is untrusted input, so
+  every response carries a Content-Security-Policy that blocks scripts,
+  remote resources, forms and framing, plus `nosniff`, `no-referrer` and
+  same-origin resource headers. Use `--allow-scripts` / `--allow-remote` only
+  for books you trust (each prints a startup warning). See [Security](#security).
+- **Fast and cached** — chapters are rendered once and kept in a size-bounded
+  cache; responses carry `ETag`s so reloads get `304 Not Modified`. Large
+  media is streamed from the zip with HTTP Range support instead of being
+  loaded into memory (in-memory files are capped at 32 MB). Chapter titles
+  for the fallback contents list are read lazily, not all at startup.
+- **Loud, not silent** — problems such as an unreadable `encryption.xml` or a
+  broken table of contents print a warning on stderr instead of being ignored.
+
 ## Requirements
 
 - Python 3.7 or later.
@@ -62,11 +84,13 @@ This starts a local server and opens your browser to it automatically.
 
 | Option         | Default       | Description                                              |
 |----------------|---------------|-----------------------------------------------------------|
-| `epub`         | *(required)*  | Path to an `.epub` file, or a folder of already-extracted contents |
+| `path`         | *(required)*  | An `.epub` or `.pdf` file, or a folder: either already-extracted epub contents or a folder of PDFs to host |
 | `--port PORT`  | `8000`        | Port to serve on                                          |
 | `--host HOST`  | `127.0.0.1`   | Host/interface to bind to                                  |
 | `--no-browser` | off           | Don't automatically open a browser tab                    |
 | `--verbose`    | off           | Log every request (failed requests are always logged)     |
+| `--allow-scripts` | off        | Let JavaScript inside the book run (blocked by default)   |
+| `--allow-remote`  | off        | Let the book load images/styles/etc. from `https://` sites (blocked by default) |
 
 ### Examples
 
@@ -99,6 +123,43 @@ python epub_server.py my-book.epub --host 0.0.0.0
 
 Stop the server with `Ctrl+C`.
 
+### Hosting PDFs
+
+Serve one PDF:
+```
+python epub_server.py paper.pdf
+```
+
+Serve every PDF under a folder (subfolders included; hidden files and folders
+are skipped):
+```
+python epub_server.py ./my-pdfs/
+```
+
+Share a PDF library with other devices on your network (only on networks you
+trust — anyone who can reach the port can read every PDF in the folder):
+```
+python epub_server.py ./my-pdfs/ --host 0.0.0.0 --no-browser
+```
+
+How the path is interpreted:
+
+- A file is treated as a PDF if it ends in `.pdf` or starts with the `%PDF-`
+  signature, so a PDF without an extension still works.
+- A folder is treated as an extracted epub if it contains
+  `META-INF/container.xml`; otherwise, if it contains any PDFs, it's treated as
+  a PDF library.
+
+Pages: `/` is the library (or the viewer, when you pointed at one file),
+`/view/<id>` is a viewer, `/pdf/<id>` is the raw PDF shown inline, and
+`/dl/<id>` forces a download. The `<id>` is derived from the file's path
+inside the library, and only files found by the scan can be requested — a URL
+can't be used to reach anything else on disk.
+
+The viewer uses your browser's built-in PDF support. Some mobile browsers
+(Android Chrome, for example) don't show PDFs inline; there, use the "Open in
+new tab" or "Download" links in the viewer's top bar.
+
 ### Troubleshooting
 
 - **A book looks unstyled or has missing images/fonts** — watch the terminal.
@@ -107,6 +168,36 @@ Stop the server with `Ctrl+C`.
   `--verbose` to see every request.
 - **"Address already in use"** — another copy (or another program) is on that
   port. Pick a different one with `--port`.
+
+## Security
+
+- Scripts, remote content, `<form>` submission and framing are blocked by the
+  CSP unless you opt in with `--allow-scripts` / `--allow-remote`. With
+  `--allow-scripts` the other restrictions stay in force.
+- When bound to a loopback address (the default), requests whose `Host`
+  header isn't `localhost`/`127.0.0.1`/`::1` get `403`, which defeats DNS
+  rebinding attacks from web pages in your browser. Binding to `0.0.0.0` or
+  another address turns this check off and prints a warning: anyone who can
+  reach the port can read the book or PDFs.
+- XML with `<!ENTITY>` declarations is refused (entity-expansion bombs);
+  parsing of titles/bodies uses linear-time scanners, so hostile files
+  can't stall the server; table-of-contents nesting is capped.
+- DRM detection can't be sidestepped with alternate Unicode/zip spellings of
+  a protected file's name.
+- Extracted folders never serve dotfiles or dot-folders (`.git`, `.env`, ...),
+  and nothing outside the book's folder is reachable.
+- PDF libraries skip symlinks that point outside the folder and anything that
+  isn't a regular file; only files found by a scan can be requested.
+- Internal errors return a generic `500`; details go to the terminal only.
+  Logged paths have control characters neutralised. Idle connections time out.
+
+## Tests
+
+```
+python -m unittest discover -s tests -v
+```
+
+Standard library only; the suite starts real servers on free local ports.
 
 ## How it works
 
@@ -140,5 +231,10 @@ Stop the server with `Ctrl+C`.
 - **Fixed-layout / comic-style EPUBs** — these will load, but the injected
   nav bar isn't specially adapted for precisely-positioned fixed-layout
   pages, so it may overlap content on some of them.
+- **Mix EPUBs and PDFs in one library** — a run serves either one EPUB or
+  PDFs, not both. Folder mode only picks up PDFs.
+- **PDF extras** — no text search, thumbnails, or reading-progress tracking;
+  the viewer is whatever your browser provides. Password-protected PDFs are
+  served as-is, and your browser's viewer will prompt for the password.
 - It's read-only — nothing is ever extracted or written to disk; the epub
-  is served directly out of the zip (or folder) you pointed it at.
+  (or PDF) is served directly from the file or folder you pointed it at.
