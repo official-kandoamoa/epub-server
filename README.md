@@ -33,8 +33,8 @@ single `.pdf`, or a whole folder of them.
   automatically fall back to the forgiving HTML parser instead of showing an
   XML error page.
 - **Root-absolute links work** — references like `href="/styles/main.css"`
-  or `src="/OEBPS/images/a.png"` are resolved against the book (package folder
-  first, then the epub root) instead of 404ing.
+  or `src="/OEBPS/images/a.png"` are resolved against the book (the epub root
+  first, then the package folder) instead of 404ing.
 - **Won't be fooled by embedded examples** — a literal `<body>`, `<title>`,
   or `<h1>` shown as example markup inside a comment, CDATA section, or a
   `<script>`/`<style>` block (common in programming and web-dev books) is
@@ -63,7 +63,9 @@ single `.pdf`, or a whole folder of them.
   cache; responses carry `ETag`s so reloads get `304 Not Modified`. Large
   media is streamed from the zip with HTTP Range support instead of being
   loaded into memory (in-memory files are capped at 32 MB). Chapter titles
-  for the fallback contents list are read lazily, not all at startup.
+  for the fallback contents list (books with no table of contents) are read
+  on first use, not at startup; the first visit to the index page reads each
+  chapter once, then the titles are remembered.
 - **Loud, not silent** — problems such as an unreadable `encryption.xml` or a
   broken table of contents print a warning on stderr instead of being ignored.
 
@@ -146,6 +148,8 @@ How the path is interpreted:
 
 - A file is treated as a PDF if it ends in `.pdf` or starts with the `%PDF-`
   signature, so a PDF without an extension still works.
+- Inside a folder, only files ending in `.pdf` are listed (extensionless PDFs
+  are only recognised when you pass them as the path itself).
 - A folder is treated as an extracted epub if it contains
   `META-INF/container.xml`; otherwise, if it contains any PDFs, it's treated as
   a PDF library.

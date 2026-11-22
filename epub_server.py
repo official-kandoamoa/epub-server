@@ -50,6 +50,7 @@ import traceback
 import unicodedata
 import webbrowser
 import zipfile
+import zlib
 import bisect
 import socket
 from collections import OrderedDict
@@ -135,7 +136,6 @@ def build_csp(allow_scripts=False, allow_remote=False):
     )
 
 
-EPUB_CSP = build_csp()
 LOOPBACK_NAMES = {'localhost', '127.0.0.1', '::1'}
 
 
@@ -531,6 +531,8 @@ class Book:
         rootfile = root.find('.//c:rootfile', CONTAINER_NS)
         if rootfile is None:
             raise ValueError('container.xml has no <rootfile> - not a valid EPUB')
+        if not rootfile.get('full-path'):
+            raise ValueError('container.xml <rootfile> has no full-path - not a valid EPUB')
         full_path, _ = resolve_href(rootfile.get('full-path'), '')
         return posixpath.dirname(full_path), full_path
 
@@ -678,16 +680,23 @@ class Book:
     def _parse_nav_toc(self, nav_path):
         root, base_dir = parse_xml(self.source.read(nav_path)), posixpath.dirname(nav_path)
         toc_nav = None
-        for nav in _find_descendants(root, 'nav', XHTML_NS_URI):
+        navs = _find_descendants(root, 'nav', XHTML_NS_URI)
+        for nav in navs:
             t = nav.get(f'{{{EPUB_OPS_NS_URI}}}type', '') or nav.get('type', '')
             if 'toc' in t.split():
                 toc_nav = nav
                 break
-        navs = _find_descendants(root, 'nav', XHTML_NS_URI)
         if toc_nav is None and navs:
             toc_nav = navs[0]  # no epub:type="toc" found - best guess
         ol = _find_child(toc_nav, 'ol', XHTML_NS_URI) if toc_nav is not None else None
         return self._parse_nav_ol(ol, base_dir) if ol is not None else []
+
+    def _warn_toc_truncated(self):
+        if not getattr(self, '_toc_truncated_warned', False):
+            self._toc_truncated_warned = True
+            warn(
+                f'table of contents nests deeper than {MAX_TOC_DEPTH} levels; deeper entries dropped'
+            )
 
     def _parse_nav_ol(self, ol, base_dir, depth=0):
         entries = []
@@ -705,6 +714,8 @@ class Book:
             ):
                 path, frag = resolve_href(a.get('href'), base_dir)
             child = _find_child(li, 'ol', XHTML_NS_URI)
+            if child is not None and depth >= MAX_TOC_DEPTH:
+                self._warn_toc_truncated()
             children = (
                 self._parse_nav_ol(child, base_dir, depth + 1)
                 if child is not None and depth < MAX_TOC_DEPTH
@@ -729,6 +740,8 @@ class Book:
             path = frag = ''
             if content is not None and content.get('src'):
                 path, frag = resolve_href(content.get('src'), base_dir)
+            if depth >= MAX_TOC_DEPTH and _find_children(np, 'navPoint', NCX_NS_URI):
+                self._warn_toc_truncated()
             children = (
                 self._parse_navpoints(np, base_dir, depth + 1) if depth < MAX_TOC_DEPTH else []
             )
@@ -748,13 +761,23 @@ class Book:
         if text is None:
             try:
                 text = sniff_text(self.read_resource(path))
-            except (KeyError, FileNotFoundError, DrmProtectedError, ResourceTooLargeError):
+            except (
+                KeyError,
+                FileNotFoundError,
+                DrmProtectedError,
+                ResourceTooLargeError,
+                zipfile.BadZipFile,
+                zlib.error,
+            ):
                 text = None
         if text is not None:
             text = text[:TITLE_SCAN_CHARS]
-            inner = first_real_element_text(text, 'title') or first_real_element_text(text, 'h1')
-            if inner is not None:
-                title = html.unescape(TAG_RE.sub('', inner)).strip()
+            for name in ('title', 'h1'):  # a blank <title> falls through to the <h1>
+                inner = first_real_element_text(text, name)
+                clean = html.unescape(TAG_RE.sub('', inner)).strip() if inner is not None else ''
+                if clean:
+                    title = clean
+                    break
         self._titles[path] = title
         return title
 
@@ -795,7 +818,8 @@ def make_link(path, fragment=''):
 
 
 def make_nav_bar(book, current_path, text=None):
-    idx = book.spine.index(current_path) if current_path in book.spine else -1
+    keys = [book._key(p) for p in book.spine]  # same spelling rules as DRM checks (NFC etc.)
+    idx = keys.index(book._key(current_path)) if book._key(current_path) in keys else -1
     prev = f'<a href="{make_link(book.spine[idx-1])}">&#8592; Prev</a>' if idx > 0 else ''
     nxt = (
         f'<a href="{make_link(book.spine[idx+1])}">Next &#8594;</a>'
@@ -1032,7 +1056,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             failed = False
         if self.verbose or failed:
-            print(f'{code} {self.command} {printable(self.path)}', file=sys.stderr)
+            print(f'{code} {printable(self.command)} {printable(self.path)}', file=sys.stderr)
 
     def end_headers(self):
         # Every response gets these - including the ones the standard library generates for
@@ -1232,6 +1256,10 @@ class ReaderHandler(BaseHTTPRequestHandler):
                     remaining -= len(chunk)
             except (BrokenPipeError, ConnectionResetError):
                 pass  # the browser closed the tab or seeked elsewhere
+            except Exception as exc:  # corrupt zip entry, disk error...
+                # The headers are already out, so a 500 can't follow: report and drop the connection.
+                warn(f'stream failed part-way: {printable(repr(exc))}')
+                self.close_connection = True
 
 
 # ---------------------------------------------------------------------------
@@ -1297,6 +1325,7 @@ class PdfLibrary:
         self.root = Path(path).resolve()
         self.single = self.root.is_file()
         self._by_id = {}
+        self._scan_lock = threading.Lock()
 
     def is_inside(self, path):
         """Whether `path`, with symlinks followed, still lies within the served folder."""
@@ -1312,8 +1341,11 @@ class PdfLibrary:
         """The entry with this id: from the last scan, else (a PDF added since) a fresh one."""
         entry = self._by_id.get(entry_id)
         if entry is None:
-            self.scan()
-            entry = self._by_id.get(entry_id)
+            with self._scan_lock:  # concurrent misses share one rescan
+                entry = self._by_id.get(entry_id)
+                if entry is None:
+                    self.scan()
+                    entry = self._by_id.get(entry_id)
         return entry
 
     def scan(self):
@@ -1571,18 +1603,14 @@ def main():
     if book.obfuscated_fonts:
         print(f'{len(book.obfuscated_fonts)} obfuscated font(s) will be de-obfuscated on the fly')
     if book.has_drm:
-        print(
-            f'warning: {len(book.drm_paths)} resource(s) are DRM-protected and will not be viewable'
-        )
+        warn(f'{len(book.drm_paths)} resource(s) are DRM-protected and will not be viewable')
     ReaderHandler.book = book
     ReaderHandler.verbose = args.verbose
     ReaderHandler.chapter_cache = ByteLRU(CHAPTER_CACHE_BYTES)
     if args.allow_scripts:
-        print(
-            'warning: scripts inside the book are allowed to run - only do this for books you trust'
-        )
+        warn('scripts inside the book are allowed to run - only do this for books you trust')
     if args.allow_remote:
-        print('warning: the book may load content from https:// sites - only for books you trust')
+        warn('the book may load content from https:// sites - only for books you trust')
     ReaderHandler.csp = build_csp(args.allow_scripts, args.allow_remote)
     run_server(ReaderHandler, args.host, args.port, args.no_browser)
 

@@ -438,7 +438,7 @@ class SmallHelperTests(unittest.TestCase):
         self.assertNotIn("script-src 'none'", scripts)
         self.assertIn("'unsafe-inline'", scripts.split('script-src')[1])
         self.assertIn('https:', es.build_csp(allow_remote=True))
-        self.assertEqual(es.EPUB_CSP, default)
+        self.assertEqual(es.build_csp(), default)
 
     def test_resolve_href(self):
         self.assertEqual(
@@ -499,7 +499,7 @@ class EpubServerTests(TempDirCase):
         cls.handler = quiet_handler(
             es.ReaderHandler,
             book=cls.book,
-            csp=es.EPUB_CSP,
+            csp=es.build_csp(),
             chapter_cache=es.ByteLRU(es.CHAPTER_CACHE_BYTES),
         )
         cls.srv = Running(cls.handler)
@@ -656,7 +656,7 @@ class EpubServerTests(TempDirCase):
         for path in ('/', '/book/OEBPS/c1.xhtml', '/book/OEBPS/img/pic.png', '/book/OEBPS/nope'):
             r = self.srv.get(path)
             policy = r.headers.get('content-security-policy', '')
-            self.assertEqual(policy, es.EPUB_CSP, path)
+            self.assertEqual(policy, es.build_csp(), path)
             self.assertIn("script-src 'none'", policy)
             self.assertIn("default-src 'self' data:", policy)
 
@@ -687,7 +687,7 @@ class EpubServerTests(TempDirCase):
             self.assertEqual(r.headers.get('x-content-type-options'), 'nosniff', r.status)
             self.assertEqual(r.headers.get('referrer-policy'), 'no-referrer', r.status)
             self.assertEqual(r.headers.get('cross-origin-resource-policy'), 'same-origin', r.status)
-            self.assertEqual(r.headers.get('content-security-policy'), es.EPUB_CSP, r.status)
+            self.assertEqual(r.headers.get('content-security-policy'), es.build_csp(), r.status)
             # sent once, not twice
             self.assertNotIn(',', r.headers['x-content-type-options'])
 
@@ -802,7 +802,7 @@ class ExtractedFolderTests(TempDirCase):
             quiet_handler(
                 es.ReaderHandler,
                 book=cls.book,
-                csp=es.EPUB_CSP,
+                csp=es.build_csp(),
                 chapter_cache=es.ByteLRU(es.CHAPTER_CACHE_BYTES),
             )
         )
@@ -1147,7 +1147,7 @@ class CachePoisoningTests(TempDirCase):
             quiet_handler(
                 es.ReaderHandler,
                 book=cls.book,
-                csp=es.EPUB_CSP,
+                csp=es.build_csp(),
                 chapter_cache=es.ByteLRU(es.CHAPTER_CACHE_BYTES),
                 allowed_hosts=es.allowed_host_names('127.0.0.1'),
             )
@@ -1232,6 +1232,115 @@ class CachePoisoningTests(TempDirCase):
                 self.assertIn(code, s.recv(100))
 
 
+class ReviewFollowUpTests(TempDirCase):
+    """Findings from an outside code review, each checked against the real behaviour."""
+
+    def test_unnamespaced_toc_does_not_duplicate_nested_entries(self):
+        files = main_epub_files()
+        files['OEBPS/nav.xhtml'] = (
+            b'<html><body><nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><ol>'
+            b'<li><a href="c1.xhtml">Ch 1</a><ol><li><a href="c2.xhtml">Sec 1.1</a></li></ol></li>'
+            b'</ol></nav></body></html>'
+        )
+        book, _ = load_book(write_epub(self.tmp / 'plain_toc.epub', files))
+        flat = []
+
+        def walk(entries):
+            for e in entries:
+                flat.append(e.title)
+                walk(e.children)
+
+        walk(book.toc)
+        self.assertEqual(flat, ['Ch 1', 'Sec 1.1'])
+
+    def test_rootfile_without_full_path_is_a_clear_error(self):
+        files = main_epub_files()
+        files['META-INF/container.xml'] = (
+            b'<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+            b'<rootfiles><rootfile media-type="x"/></rootfiles></container>'
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, 'full-path'):
+                es.Book(es.open_source(write_epub(self.tmp / 'nofp.epub', files)))
+
+    def test_blank_title_falls_back_to_h1_and_corrupt_chapter_to_filename(self):
+        files = main_epub_files()
+        files['OEBPS/c1.xhtml'] = (
+            b'<html><head><title>   </title></head><body><h1>Real</h1></body></html>'
+        )
+        book, _ = load_book(write_epub(self.tmp / 'blank.epub', files))
+        self.assertEqual(book.title_for('OEBPS/c1.xhtml'), 'Real')
+        with mock.patch.object(book, 'read_resource', side_effect=zipfile.BadZipFile('crc')):
+            self.assertEqual(book.title_for('OEBPS/c2.xhtml'), 'c2')
+
+    def test_nav_bar_still_finds_the_chapter_under_another_unicode_spelling(self):
+        book, _ = load_book(write_epub(self.tmp / 'nfdnav.epub', main_epub_files()))
+        nfc = 'OEBPS/café.xhtml'
+        nfd = unicodedata.normalize('NFD', nfc)
+        self.assertEqual(es.make_nav_bar(book, nfd), es.make_nav_bar(book, nfc))
+        self.assertIn('Prev', es.make_nav_bar(book, nfd))
+
+    def test_log_line_neutralises_escape_sequences_in_the_method(self):
+        handler = quiet_handler(es.ReaderHandler, book=None)
+        h = handler.__new__(handler)
+        h.verbose, h.command, h.path = True, '\x1b[31mGET', '/\x1b]52;c;x\x07'
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            es.ReaderHandler.log_request(h, 404)
+        self.assertNotIn('\x1b', err.getvalue())
+        self.assertNotIn('\x07', err.getvalue())
+
+    def test_stream_failure_after_headers_closes_the_connection(self):
+        class Boom:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def seek(self, n):
+                pass
+
+            def read(self, n):
+                raise zipfile.BadZipFile('crc mismatch')
+
+        handler = quiet_handler(es.ReaderHandler, book=None, csp=None)
+        h = handler.__new__(handler)
+        h.headers, h._head_only, h.close_connection = {}, False, False
+        h.send_response = h.send_header = h.end_headers = lambda *a, **k: None
+        h._send_common_headers = lambda *a, **k: None
+        h.wfile = io.BytesIO()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            h._send_stream(Boom(), 100, 'video/mp4', '"e"')
+        self.assertTrue(h.close_connection)
+        self.assertEqual(h.wfile.getvalue(), b'')  # no second (500) response appended
+        self.assertIn('stream failed', err.getvalue())
+
+    def test_security_warnings_go_to_stderr(self):
+        epub = write_epub(self.tmp / 'warnflags.epub', main_epub_files())
+        cli = Cli(epub, '--allow-scripts')
+        try:
+            cli.get('/')
+        finally:
+            out, err = cli.stop()
+        self.assertIn('scripts inside the book', err)
+        self.assertNotIn('scripts inside the book', out)
+
+    def test_deep_toc_warns_once_about_truncation(self):
+        deep = es.MAX_TOC_DEPTH + 3
+        nav = (
+            '<html xmlns="http://www.w3.org/1999/xhtml"><body><nav><ol>'
+            + '<li><a href="c1.xhtml">x</a><ol>' * deep
+            + '</ol></li>' * deep
+            + '</ol></nav></body></html>'
+        )
+        files = main_epub_files()
+        files['OEBPS/nav.xhtml'] = nav.encode()
+        _, err = load_book(write_epub(self.tmp / 'deepwarn.epub', files))
+        self.assertEqual(err.count('nests deeper'), 1)
+
+
 class HardeningTests(TempDirCase):
     """Hostile inputs: nothing here may hang, leak, or bypass a protection."""
 
@@ -1287,7 +1396,7 @@ class HardeningTests(TempDirCase):
         (folder / '.git').mkdir()
         (folder / '.git' / 'config').write_text('token')
         book, _ = load_book(folder)
-        srv = Running(quiet_handler(es.ReaderHandler, book=book, csp=es.EPUB_CSP))
+        srv = Running(quiet_handler(es.ReaderHandler, book=book, csp=es.build_csp()))
         self.addCleanup(srv.close)
         self.assertEqual(srv.get('/book/OEBPS/.secret.txt').status, 404)
         self.assertEqual(srv.get('/book/.git/config').status, 404)
@@ -1299,7 +1408,7 @@ class HardeningTests(TempDirCase):
             quiet_handler(
                 es.ReaderHandler,
                 book=book,
-                csp=es.EPUB_CSP,
+                csp=es.build_csp(),
                 allowed_hosts=es.allowed_host_names('127.0.0.1'),
             )
         )
@@ -1315,7 +1424,7 @@ class HardeningTests(TempDirCase):
             raise RuntimeError('SECRET-PATH /etc/shadow')
 
         book.read_resource = boom
-        srv = Running(quiet_handler(es.ReaderHandler, book=book, csp=es.EPUB_CSP))
+        srv = Running(quiet_handler(es.ReaderHandler, book=book, csp=es.build_csp()))
         self.addCleanup(srv.close)
         with contextlib.redirect_stderr(io.StringIO()):
             r = srv.get('/book/OEBPS/style.css')
@@ -1389,22 +1498,22 @@ class CommandLineTests(TempDirCase):
         return r.headers.get('content-security-policy', ''), out, err
 
     def test_scripts_and_remote_content_are_blocked_by_default(self):
-        policy, out, _ = self.policy_for()
+        policy, out, err = self.policy_for()
         self.assertEqual(policy, es.build_csp())
-        self.assertNotIn('warning: scripts', out)
+        self.assertNotIn('warning: scripts', out + err)
 
     def test_allow_scripts_flag_permits_scripts_and_warns(self):
-        policy, out, _ = self.policy_for('--allow-scripts')
+        policy, _, err = self.policy_for('--allow-scripts')
         self.assertEqual(policy, es.build_csp(allow_scripts=True))
         self.assertNotIn("script-src 'none'", policy)
         self.assertNotIn('https:', policy)  # remote content is a separate switch
-        self.assertIn('scripts inside the book are allowed', out)
+        self.assertIn('scripts inside the book are allowed', err)
 
     def test_allow_remote_flag_permits_https_content_and_warns(self):
-        policy, out, _ = self.policy_for('--allow-remote')
+        policy, _, err = self.policy_for('--allow-remote')
         self.assertEqual(policy, es.build_csp(allow_remote=True))
         self.assertIn("script-src 'none'", policy)  # still no scripts
-        self.assertIn('https:// sites', out)
+        self.assertIn('https:// sites', err)
 
     def test_loopback_server_refuses_foreign_host_headers(self):
         cli = Cli(self.epub)
