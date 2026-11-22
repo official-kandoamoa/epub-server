@@ -50,6 +50,8 @@ import traceback
 import unicodedata
 import webbrowser
 import zipfile
+import bisect
+import socket
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -66,16 +68,29 @@ EPUB_OPS_NS_URI = 'http://www.idpf.org/2007/ops'
 NCX_NS_URI = 'http://www.daisy.org/z3986/2005/ncx/'
 XML_ENC_NS_URI = 'http://www.w3.org/2001/04/xmlenc#'
 
-TITLE_RE = re.compile(r'<title[^>]*>(.*?)</title>', re.IGNORECASE | re.DOTALL)
-H1_RE = re.compile(r'<h1[^>]*>(.*?)</h1>', re.IGNORECASE | re.DOTALL)
-TAG_RE = re.compile(r'<[^>]+>')
+TAG_RE = re.compile(r'<[^<>]*>')
 XML_DECL_RE = re.compile(r'^\s*<\?xml[^>]*\?>\s*')
-BODY_OPEN_RE = re.compile(r'<body\b[^>]*>', re.IGNORECASE)
 
-SKIP_BLOCK_RE = re.compile(
-    r'<!--.*?-->|<!\[CDATA\[.*?\]\]>|<(script|style)\b[^>]*>.*?</\1\s*>',
-    re.IGNORECASE | re.DOTALL,
-)
+# Everything below that looks through a chapter's markup is written to take time proportional
+# to the chapter's size, whatever it contains. A pattern like `<!--.*?-->` is not: given a
+# file with thousands of unterminated `<!--`, each one rescans the rest of the file, so a
+# few hundred KB of hostile markup can freeze the (single-threaded-in-practice) server for
+# minutes. So the openers are matched with patterns that cannot run past the next `<` or `>`,
+# and the closers are looked for with one forward search that, on failure, ends the work.
+_SKIP_START_RE = re.compile(r'<!--|<!\[CDATA\[|<(script|style)\b[^<>]*>', re.IGNORECASE)
+_COMMENT_CDATA_START_RE = re.compile(r'<!--|<!\[CDATA\[')
+_SKIP_END_RES = {
+    '<!--': re.compile(r'-->'),
+    '<![cdata[': re.compile(r'\]\]>'),
+    'script': re.compile(r'</script\s*>', re.IGNORECASE),
+    'style': re.compile(r'</style\s*>', re.IGNORECASE),
+}
+_OPEN_TAG_RES = {
+    name: re.compile(rf'<{name}\b[^<>]*>', re.IGNORECASE) for name in ('title', 'h1', 'body')
+}
+_CLOSE_TAG_RES = {name: re.compile(rf'</{name}\s*>', re.IGNORECASE) for name in ('title', 'h1')}
+# Only the start of a chapter is searched for its title.
+TITLE_SCAN_CHARS = 256 * 1024
 
 IDPF_FONT_ALG = 'http://www.idpf.org/2008/embedding'
 ADOBE_FONT_ALG = 'http://ns.adobe.com/pdf/enc#RC'
@@ -86,15 +101,62 @@ RTL_LANGUAGES = {'ar', 'he', 'fa', 'ur', 'yi', 'ps', 'sd', 'dv', 'ckb', 'syr'}
 # memory (and the cap below stops a hostile or corrupt entry from exhausting it); anything
 # bigger than STREAM_THRESHOLD that isn't text - and all audio/video - is streamed in chunks
 # instead, with Range support so media can seek.
-MAX_INMEMORY_BYTES = 64 * 1024 * 1024
+MAX_INMEMORY_BYTES = 32 * 1024 * 1024
+# A table of contents nested deeper than this is cut off there (real ones are 2-4 levels), so
+# a hostile one can't exhaust the interpreter's recursion limit while it is parsed and drawn.
+MAX_TOC_DEPTH = 32
 STREAM_THRESHOLD = 4 * 1024 * 1024
 STREAM_CHUNK = 64 * 1024
 CHAPTER_CACHE_BYTES = 32 * 1024 * 1024
 TEXT_DOC_EXTS = ('.xhtml', '.html', '.htm')
 # Bump when the way chapters are processed changes, so browsers drop their cached copies.
 ETAG_SALT = 'e2'
-# Scripts inside a book are blocked by default; see --allow-scripts.
-EPUB_CSP = "script-src 'none'"
+
+
+def build_csp(allow_scripts=False, allow_remote=False):
+    """The Content-Security-Policy sent with every EPUB response.
+
+    A book is untrusted content served from your own machine, so by default it may not run
+    scripts and may only load things from the book itself (or inline `data:` URLs): no
+    tracking pixels, remote fonts or stylesheets, no forms, no framing by other sites.
+    --allow-scripts and --allow-remote relax that for a book you trust."""
+    remote = ' https:' if allow_remote else ''
+    scripts = ("'self' 'unsafe-inline' 'unsafe-eval'" + remote) if allow_scripts else "'none'"
+    return '; '.join(
+        [
+            f"default-src 'self' data:{remote}",
+            f"style-src 'self' 'unsafe-inline'{remote}",
+            f'script-src {scripts}',
+            "object-src 'self'",
+            "base-uri 'self'",
+            "form-action 'none'",
+            "frame-ancestors 'none'",
+        ]
+    )
+
+
+EPUB_CSP = build_csp()
+LOOPBACK_NAMES = {'localhost', '127.0.0.1', '::1'}
+
+
+def allowed_host_names(bind_host):
+    """The Host header values to accept when listening on a loopback address, else None.
+
+    A web page can point its own domain name at 127.0.0.1 ("DNS rebinding") and then read
+    whatever is served here as if it were its own site. Browsers still send that page's
+    domain in the Host header, so refusing anything that isn't a loopback name stops it."""
+    if bind_host in LOOPBACK_NAMES or bind_host.startswith('127.'):
+        return LOOPBACK_NAMES | {bind_host}
+    return None
+
+
+def host_header_name(value):
+    """The host part of a Host header: no port, no brackets, lower case, no trailing dot."""
+    value = value.strip().lower()
+    if value.startswith('['):
+        return value[1 : value.find(']')] if ']' in value else value
+    return value.rsplit(':', 1)[0].rstrip('.') if value.count(':') == 1 else value.rstrip('.')
+
 
 for ext, ctype in [
     ('.woff2', 'font/woff2'),
@@ -127,7 +189,15 @@ class ZipSource:
     def __init__(self, path):
         self._zf = zipfile.ZipFile(path)
         self._lock = threading.Lock()
-        self._names = self._zf.namelist()
+        # Indexes for _find_alt_name, built once so a request for a name that isn't there
+        # costs a dictionary lookup rather than a pass over every entry in the book.
+        self._by_nfc, self._by_cp437 = {}, {}
+        for n in self._zf.namelist():
+            self._by_nfc.setdefault(unicodedata.normalize('NFC', n), n)
+            try:
+                self._by_cp437.setdefault(n.encode('cp437'), n)
+            except UnicodeEncodeError:
+                pass
 
     def _resolve(self, name):
         """The ZipInfo for `name`, tolerating odd Unicode normalization / legacy encodings."""
@@ -164,19 +234,23 @@ class ZipSource:
             f = self._zf.open(info)
         return f, info.file_size, f'{info.CRC:08x}-{info.file_size:x}'
 
-    def _find_alt_name(self, name):
-        target_nfc = unicodedata.normalize('NFC', name)
-        for n in self._names:
-            if unicodedata.normalize('NFC', n) == target_nfc:
-                return n
-        target_bytes = name.encode('utf-8', 'surrogateescape')
-        for n in self._names:
+    def canonical(self, name):
+        """The name `name` is really stored under (reads tolerate Unicode-normalization and
+        legacy-encoding spelling differences), or `name` itself if there is no such entry."""
+        with self._lock:
             try:
-                if n.encode('cp437') == target_bytes:
-                    return n
-            except UnicodeEncodeError:
-                continue
-        return None
+                return self._resolve(name).filename
+            except KeyError:
+                return name
+
+    def _find_alt_name(self, name):
+        alt = self._by_nfc.get(unicodedata.normalize('NFC', name))
+        if alt is not None:
+            return alt
+        try:
+            return self._by_cp437.get(name.encode('utf-8', 'surrogateescape'))
+        except UnicodeEncodeError:
+            return None
 
 
 class DirSource:
@@ -189,6 +263,10 @@ class DirSource:
         """Find the regular file for `name` inside the root: (path, stat result)."""
         last_exc = None
         for candidate in self._candidates(name):
+            # Hidden files and folders (.git, .env, ...) are never part of a book, and
+            # '..' starts with a dot too: neither is ever served.
+            if any(part.startswith('.') for part in candidate.split('/')):
+                continue
             try:
                 p = (self._root / candidate).resolve()
                 if self._root != p and self._root not in p.parents:
@@ -224,6 +302,10 @@ class DirSource:
         except OSError as exc:
             raise FileNotFoundError(name) from exc
         return f, st.st_size, f'{st.st_mtime_ns:x}-{st.st_size:x}'
+
+    @staticmethod
+    def canonical(name):
+        return name
 
     @staticmethod
     def _candidates(name):
@@ -278,12 +360,85 @@ def is_rtl_language(lang):
     return bool(lang and lang.split('-')[0].strip().lower() in RTL_LANGUAGES)
 
 
-def first_real_match(pattern, text):
-    skip_spans = [m.span() for m in SKIP_BLOCK_RE.finditer(text)]
-    for m in pattern.finditer(text):
-        if not any(start <= m.start() < end for start, end in skip_spans):
+def skipped_spans(text, comments_only=False):
+    """(start, end) spans of the comments, CDATA sections and - unless `comments_only` -
+    <script>/<style> blocks in `text`, in order. Something never closed runs to the end of
+    the text, which is how a browser treats it. Time is linear in len(text)."""
+    start_re = _COMMENT_CDATA_START_RE if comments_only else _SKIP_START_RE
+    spans, pos = [], 0
+    while True:
+        m = start_re.search(text, pos)
+        if m is None:
+            return spans
+        token = m.group(0)
+        if token.startswith('<!--'):
+            end_re = _SKIP_END_RES['<!--']
+        elif token.startswith('<!['):  # CDATA
+            end_re = _SKIP_END_RES['<![cdata[']
+        elif token.endswith('/>'):  # <script src="x"/>: nothing between the tags to skip
+            spans.append(m.span())
+            pos = m.end()
+            continue
+        else:
+            end_re = _SKIP_END_RES[m.group(1).lower()]
+        end = end_re.search(text, m.end())
+        if end is None:
+            spans.append((m.start(), len(text)))
+            return spans
+        spans.append((m.start(), end.end()))
+        pos = end.end()
+
+
+def _inside(spans, pos):
+    i = bisect.bisect_right(spans, (pos, float('inf'))) - 1
+    return i >= 0 and pos < spans[i][1]
+
+
+def first_real_tag(text, name, spans=None):
+    """The match for the first opening <name ...> that isn't inside a comment, CDATA section
+    or <script>/<style> block - or None."""
+    spans = skipped_spans(text) if spans is None else spans
+    pos = 0
+    while True:
+        m = _OPEN_TAG_RES[name].search(text, pos)
+        if m is None:
+            return None
+        if not _inside(spans, m.start()):
             return m
-    return None
+        pos = m.end()
+
+
+def first_real_element_text(text, name):
+    """The markup between the first real <name> and its closing tag, or None."""
+    spans = skipped_spans(text)
+    m = first_real_tag(text, name, spans)
+    if m is None or m.group(0).endswith('/>'):
+        return None
+    end = _CLOSE_TAG_RES[name].search(text, m.end())
+    return text[m.end() : end.start()] if end else None
+
+
+_ENTITY_DECL_SIGNATURES = tuple(
+    '<!ENTITY'.encode(enc) for enc in ('ascii', 'utf-16-le', 'utf-16-be')
+)
+
+
+def _has_entity_declaration(data):
+    if isinstance(data, str):
+        return '<!ENTITY' in data
+    return any(sig in data for sig in _ENTITY_DECL_SIGNATURES)
+
+
+def parse_xml(data):
+    """ET.fromstring for files that come out of an untrusted book.
+
+    Documents that declare their own entities are refused: that is the way to build a
+    "billion laughs" file (a few hundred bytes that expand to gigabytes). Current versions
+    of expat defend against it too, but this runs on whatever Python the user has. Real
+    books don't declare entities - a DOCTYPE that merely points at the XHTML DTD is fine."""
+    if _has_entity_declaration(data):
+        raise ET.ParseError('entity declarations (<!ENTITY ...>) are not allowed')
+    return ET.fromstring(data)
 
 
 def _find_child(el, name, ns_uri):
@@ -354,7 +509,11 @@ class Book:
         self.source = source
         self.opf_dir, self.opf_path = self._find_opf()
         self._parse_opf()
-        self.obfuscated_fonts, self.drm_paths = self._parse_encryption()
+        obfuscated, drm = self._parse_encryption()
+        # Keyed by canonical name, so asking for a protected file under a different (but
+        # equivalent) Unicode spelling can't slip past the DRM check or skip de-obfuscation.
+        self.obfuscated_fonts = {self._key(p): alg for p, alg in obfuscated.items()}
+        self.drm_paths = {self._key(p): alg for p, alg in drm.items()}
         self.has_drm = bool(self.drm_paths)
         self.cover = self._resolve_cover()
         self._titles = {}  # chapter path -> title, filled in on demand by title_for()
@@ -368,7 +527,7 @@ class Book:
             self.toc = []
 
     def _find_opf(self):
-        root = ET.fromstring(self.source.read('META-INF/container.xml'))
+        root = parse_xml(self.source.read('META-INF/container.xml'))
         rootfile = root.find('.//c:rootfile', CONTAINER_NS)
         if rootfile is None:
             raise ValueError('container.xml has no <rootfile> - not a valid EPUB')
@@ -376,7 +535,7 @@ class Book:
         return posixpath.dirname(full_path), full_path
 
     def _parse_opf(self):
-        root = ET.fromstring(self.source.read(self.opf_path))
+        root = parse_xml(self.source.read(self.opf_path))
 
         def texts(tag):
             return [
@@ -458,7 +617,7 @@ class Book:
         except (KeyError, FileNotFoundError):
             return {}, {}
         try:
-            root = ET.fromstring(raw)
+            root = parse_xml(raw)
         except ET.ParseError as exc:
             warn(
                 f'META-INF/encryption.xml is not valid XML ({exc}); protected content, '
@@ -481,28 +640,33 @@ class Book:
             (obfuscated if alg in FONT_OBFUSCATION_WINDOWS else drm)[path] = alg or 'unknown'
         return obfuscated, drm
 
+    def _key(self, path):
+        return unicodedata.normalize('NFC', self.source.canonical(path))
+
     def is_drm(self, path):
-        return path in self.drm_paths
+        return self._key(path) in self.drm_paths
 
     def is_obfuscated(self, path):
-        return path in self.obfuscated_fonts
+        return self._key(path) in self.obfuscated_fonts
 
     def exists(self, path):
         return self.source.exists(path)
 
     def read_resource(self, path):
-        if path in self.drm_paths:
-            raise DrmProtectedError(path, self.drm_paths[path])
+        key = self._key(path)
+        if key in self.drm_paths:
+            raise DrmProtectedError(path, self.drm_paths[key])
         raw = self.source.read(path)
-        alg = self.obfuscated_fonts.get(path)
+        alg = self.obfuscated_fonts.get(key)
         return deobfuscate_font(raw, alg, self.identifier) if alg else raw
 
     def open_resource(self, path):
         """Open a resource for streaming: (file object, size, validator).
 
         Not for obfuscated fonts, which have to be de-obfuscated in memory."""
-        if path in self.drm_paths:
-            raise DrmProtectedError(path, self.drm_paths[path])
+        key = self._key(path)
+        if key in self.drm_paths:
+            raise DrmProtectedError(path, self.drm_paths[key])
         return self.source.open(path)
 
     def _build_toc(self):
@@ -512,7 +676,7 @@ class Book:
         return self._parse_nav_toc(path) if kind == 'nav' else self._parse_ncx_toc(path)
 
     def _parse_nav_toc(self, nav_path):
-        root, base_dir = ET.fromstring(self.source.read(nav_path)), posixpath.dirname(nav_path)
+        root, base_dir = parse_xml(self.source.read(nav_path)), posixpath.dirname(nav_path)
         toc_nav = None
         for nav in _find_descendants(root, 'nav', XHTML_NS_URI):
             t = nav.get(f'{{{EPUB_OPS_NS_URI}}}type', '') or nav.get('type', '')
@@ -525,7 +689,7 @@ class Book:
         ol = _find_child(toc_nav, 'ol', XHTML_NS_URI) if toc_nav is not None else None
         return self._parse_nav_ol(ol, base_dir) if ol is not None else []
 
-    def _parse_nav_ol(self, ol, base_dir):
+    def _parse_nav_ol(self, ol, base_dir, depth=0):
         entries = []
         for li in _find_children(ol, 'li', XHTML_NS_URI):
             a = _find_child(li, 'a', XHTML_NS_URI)
@@ -541,17 +705,21 @@ class Book:
             ):
                 path, frag = resolve_href(a.get('href'), base_dir)
             child = _find_child(li, 'ol', XHTML_NS_URI)
-            children = self._parse_nav_ol(child, base_dir) if child is not None else []
+            children = (
+                self._parse_nav_ol(child, base_dir, depth + 1)
+                if child is not None and depth < MAX_TOC_DEPTH
+                else []
+            )
             if title or children:
                 entries.append(TocEntry(title or path or 'Untitled', path, frag, children))
         return entries
 
     def _parse_ncx_toc(self, ncx_path):
-        root, base_dir = ET.fromstring(self.source.read(ncx_path)), posixpath.dirname(ncx_path)
+        root, base_dir = parse_xml(self.source.read(ncx_path)), posixpath.dirname(ncx_path)
         navmap = _find_child(root, 'navMap', NCX_NS_URI)
         return self._parse_navpoints(navmap, base_dir) if navmap is not None else []
 
-    def _parse_navpoints(self, parent, base_dir):
+    def _parse_navpoints(self, parent, base_dir, depth=0):
         entries = []
         for np in _find_children(parent, 'navPoint', NCX_NS_URI):
             label = _find_child(np, 'navLabel', NCX_NS_URI)
@@ -561,7 +729,9 @@ class Book:
             path = frag = ''
             if content is not None and content.get('src'):
                 path, frag = resolve_href(content.get('src'), base_dir)
-            children = self._parse_navpoints(np, base_dir)
+            children = (
+                self._parse_navpoints(np, base_dir, depth + 1) if depth < MAX_TOC_DEPTH else []
+            )
             if title or children:
                 entries.append(TocEntry(title or path or 'Untitled', path, frag, children))
         return entries
@@ -581,9 +751,10 @@ class Book:
             except (KeyError, FileNotFoundError, DrmProtectedError, ResourceTooLargeError):
                 text = None
         if text is not None:
-            m = first_real_match(TITLE_RE, text) or first_real_match(H1_RE, text)
-            if m:
-                title = html.unescape(TAG_RE.sub('', m.group(1))).strip()
+            text = text[:TITLE_SCAN_CHARS]
+            inner = first_real_element_text(text, 'title') or first_real_element_text(text, 'h1')
+            if inner is not None:
+                title = html.unescape(TAG_RE.sub('', inner)).strip()
         self._titles[path] = title
         return title
 
@@ -709,7 +880,6 @@ DRM_MESSAGE = (
 
 _XML_ONLY_ENTITIES = {'lt', 'gt', 'amp', 'quot', 'apos'}
 _ENTITY_REF_RE = re.compile(r'&([A-Za-z][A-Za-z0-9]*);')
-_COMMENT_OR_CDATA_RE = re.compile(r'<!--.*?-->|<!\[CDATA\[.*?\]\]>', re.DOTALL)
 
 
 def numeric_entities(text):
@@ -731,10 +901,10 @@ def numeric_entities(text):
         return f'&#{codepoint};' if codepoint is not None else m.group(0)
 
     out, pos = [], 0
-    for m in _COMMENT_OR_CDATA_RE.finditer(text):
-        out.append(_ENTITY_REF_RE.sub(repl, text[pos : m.start()]))
-        out.append(m.group(0))
-        pos = m.end()
+    for start, end in skipped_spans(text, comments_only=True):
+        out.append(_ENTITY_REF_RE.sub(repl, text[pos:start]))
+        out.append(text[start:end])
+        pos = end
     out.append(_ENTITY_REF_RE.sub(repl, text[pos:]))
     return ''.join(out)
 
@@ -749,6 +919,8 @@ def is_wellformed_xhtml(text):
     page-anchor <a/> turns the rest of the chapter into one giant link). Real
     readers parse these as XML. Run numeric_entities() first so named HTML
     entities don't cause a false "not well-formed"."""
+    if _has_entity_declaration(text):
+        return False
     parser = ET.XMLParser()
     try:
         parser.feed(text.encode('utf-8'))
@@ -762,7 +934,7 @@ def render_chapter(book, epub_path, raw):
     """Prepare an HTML/XHTML chapter for serving: (body bytes, content type)."""
     decoded = sniff_text(raw)
     text, nav = XML_DECL_RE.sub('', decoded), make_nav_bar(book, epub_path, decoded)
-    body = first_real_match(BODY_OPEN_RE, text)
+    body = first_real_tag(text, 'body')
     text = f'{text[: body.end()]}{nav}{text[body.end() :]}' if body else nav + text
     # Well-formed XHTML is served as XML so the browser parses it the way the author
     # intended; anything sloppy falls back to the forgiving HTML parser rather than
@@ -817,11 +989,26 @@ def etag_matches(header, etag):
     return any(strip_weak(tag.strip()) == strip_weak(etag) for tag in header.split(','))
 
 
+def printable(text, limit=200):
+    """`text` made safe to print: control characters (a terminal escape sequence in a
+    request path, say) are shown as \\xNN, and it is cut off at `limit` characters."""
+    shown = ''.join(c if c.isprintable() else f'\\x{ord(c):02x}' for c in text[:limit])
+    return shown + ('...' if len(text) > limit else '')
+
+
 class ReaderHandler(BaseHTTPRequestHandler):
     book = None
     verbose = False
     csp = None  # Content-Security-Policy to send with every response, if set
     chapter_cache = None  # ByteLRU of processed chapters, if set
+    allowed_hosts = None  # accepted Host header names (DNS-rebinding defence), if set
+    timeout = 60  # seconds a client may stall on the socket before its connection is dropped
+    security_headers = {
+        'X-Content-Type-Options': 'nosniff',
+        'Referrer-Policy': 'no-referrer',
+        # Other sites can't embed this server's files (images, media, ...) into their pages.
+        'Cross-Origin-Resource-Policy': 'same-origin',
+    }
     _head_only = False
 
     def log_message(self, fmt, *args):
@@ -835,20 +1022,38 @@ class ReaderHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             failed = False
         if self.verbose or failed:
-            print(f'{code} {self.command} {self.path}', file=sys.stderr)
+            print(f'{code} {self.command} {printable(self.path)}', file=sys.stderr)
+
+    def end_headers(self):
+        # Every response gets these - including the ones the standard library generates for
+        # malformed requests - so no code path can forget them.
+        for name, value in self.security_headers.items():
+            self.send_header(name, value)
+        if self.csp:
+            self.send_header('Content-Security-Policy', self.csp)
+        super().end_headers()
+
+    def _host_allowed(self):
+        if self.allowed_hosts is None:
+            return True
+        value = self.headers.get('Host')
+        return value is None or host_header_name(value) in self.allowed_hosts
 
     def do_GET(self):
         try:
+            if not self._host_allowed():
+                self._send(403, b'Forbidden: unexpected Host header', 'text/plain; charset=utf-8')
+                return
             self._route()
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # the browser gave up on the request (closed the tab, seeked in a video, ...)
-        except Exception as exc:
-            traceback.print_exc()
-            self._send(
-                500,
-                f'Internal error: {exc}'.encode('utf-8', 'replace'),
-                'text/plain; charset=utf-8',
-            )
+        except (ConnectionError, TimeoutError, socket.timeout):
+            # The browser gave up (closed the tab, seeked in a video) or stopped reading.
+            self.close_connection = True
+        except Exception:
+            traceback.print_exc()  # the details stay in this terminal, not in the response
+            try:
+                self._send(500, b'Internal server error', 'text/plain; charset=utf-8')
+            except OSError:
+                self.close_connection = True
 
     def do_HEAD(self):  # same status and headers as GET, no body
         self._head_only = True
@@ -957,8 +1162,6 @@ class ReaderHandler(BaseHTTPRequestHandler):
             # Browsers may keep a copy but must check back first; the ETag makes that check
             # a cheap 304 instead of a re-download, and edits to a folder show up at once.
             self.send_header('Cache-Control', 'no-cache')
-        if self.csp:
-            self.send_header('Content-Security-Policy', self.csp)
         for name, value in (extra_headers or {}).items():
             self.send_header(name, value)
 
@@ -1072,14 +1275,36 @@ class PdfEntry:
 class PdfLibrary:
     """A single PDF, or every PDF found (recursively) under a folder.
 
-    The folder is rescanned on every request, so PDFs dropped in while the
-    server is running show up on a page reload. Files are addressed by an id
-    derived from their relative path - never by a path taken from the URL - so
-    a request can only ever reach a file the scan found."""
+    The folder is rescanned whenever the list or a viewer page is loaded, so PDFs
+    dropped in while the server is running show up on a page reload (the many
+    Range requests a PDF viewer makes are answered from the last scan instead).
+    Files are addressed by an id derived from their relative path - never by a
+    path taken from the URL - so a request can only ever reach a file the scan
+    found. A folder's PDFs must really be inside it: a symlink pointing at some
+    other part of the disk is skipped, as is anything that isn't a regular file."""
 
     def __init__(self, path):
         self.root = Path(path).resolve()
         self.single = self.root.is_file()
+        self._by_id = {}
+
+    def is_inside(self, path):
+        """Whether `path`, with symlinks followed, still lies within the served folder."""
+        if self.single:
+            return Path(path).resolve() == self.root
+        try:
+            real = Path(path).resolve()
+        except (OSError, RuntimeError):  # RuntimeError: a symlink loop on older Pythons
+            return False
+        return real == self.root or self.root in real.parents
+
+    def find(self, entry_id):
+        """The entry with this id: from the last scan, else (a PDF added since) a fresh one."""
+        entry = self._by_id.get(entry_id)
+        if entry is None:
+            self.scan()
+            entry = self._by_id.get(entry_id)
+        return entry
 
     def scan(self):
         if self.single:
@@ -1097,12 +1322,15 @@ class PdfLibrary:
         entries = []
         for p in found:
             try:
-                size = p.stat().st_size
+                st = p.stat()
             except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or not self.is_inside(p):
                 continue
             rel = p.relative_to(base).as_posix()
             entry_id = hashlib.sha1(rel.encode('utf-8', 'surrogateescape')).hexdigest()[:12]
-            entries.append(PdfEntry(entry_id, p, rel, p.stem, size))
+            entries.append(PdfEntry(entry_id, p, rel, p.stem, st.st_size))
+        self._by_id = {e.id: e for e in entries}
         return entries
 
 
@@ -1120,7 +1348,9 @@ def parse_byte_range(header, size):
     Returns (start, end) inclusive for a satisfiable single range, None when the
     header should be ignored (absent, malformed, multi-range - the whole file is
     sent instead, which the HTTP spec allows), or False when it can't be satisfied."""
-    m = re.fullmatch(r'\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*', header or '')
+    # At most 18 digits per number (fits any file size that exists); anything longer is
+    # treated as malformed. Converting a header's worth of digits would otherwise raise.
+    m = re.fullmatch(r'\s*bytes\s*=\s*(\d{0,18})\s*-\s*(\d{0,18})\s*', header or '')
     if not m:
         return None
     first, last = m.groups()
@@ -1183,11 +1413,14 @@ def make_pdf_viewer_html(entry, show_back):
 class PdfHandler(ReaderHandler):
     library = None
     csp = None  # PDFs are shown by the browser's own viewer; a script policy would get in its way
+    # No Cross-Origin-Resource-Policy here: some browsers fetch a PDF for their built-in
+    # viewer in a way that header can break.
+    security_headers = {'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'}
 
     def _route(self):
         path = unquote(self.path.split('?', 1)[0])
-        entries = self.library.scan()
         if path == '/':
+            entries = self.library.scan()
             if self.library.single and entries:
                 self._send(
                     200,
@@ -1198,7 +1431,7 @@ class PdfHandler(ReaderHandler):
                 self._send(200, make_pdf_library_html(entries).encode(), 'text/html; charset=utf-8')
             return
         m = PDF_URL_RE.fullmatch(path)
-        entry = next((e for e in entries if m and e.id == m.group(2)), None)
+        entry = self.library.find(m.group(2)) if m else None
         if entry is None:
             self._send(404, b'Not found', 'text/plain; charset=utf-8')
         elif m.group(1) == 'view':
@@ -1211,21 +1444,27 @@ class PdfHandler(ReaderHandler):
             self._send_pdf(entry, 'attachment' if m.group(1) == 'dl' else 'inline')
 
     def _send_pdf(self, entry, disposition):
+        gone = (b'That PDF is no longer available', 'text/plain; charset=utf-8')
+        # Checked again here: the file may have been swapped for a symlink since the scan.
+        if not self.library.is_inside(entry.path):
+            self._send(404, *gone)
+            return
         try:
             f = open(entry.path, 'rb')
         except OSError:
-            self._send(404, b'That PDF is no longer available', 'text/plain; charset=utf-8')
+            self._send(404, *gone)
             return
         st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            f.close()
+            self._send(404, *gone)
+            return
         self._send_stream(
             f,
             st.st_size,
             'application/pdf',
             f'"{st.st_mtime_ns:x}-{st.st_size:x}"',
-            {
-                'Content-Disposition': content_disposition(disposition, entry.path.name),
-                'X-Content-Type-Options': 'nosniff',
-            },
+            {'Content-Disposition': content_disposition(disposition, entry.path.name)},
         )
 
 
@@ -1243,6 +1482,12 @@ def detect_mode(path):
 
 
 def run_server(handler, host, port, no_browser):
+    handler.allowed_hosts = allowed_host_names(host)
+    if handler.allowed_hosts is None:
+        warn(
+            f'listening on {host}: anyone who can reach this machine on port {port} '
+            'can read everything being served'
+        )
     try:
         server = ThreadingHTTPServer((host, port), handler)
     except OSError as exc:
@@ -1287,6 +1532,12 @@ def main():
         action='store_true',
         help='let EPUBs run their own JavaScript (blocked by default; only for books you trust)',
     )
+    parser.add_argument(
+        '--allow-remote',
+        action='store_true',
+        help='let EPUBs load images, fonts and styles from https:// sites '
+        '(blocked by default, so a book cannot phone home while you read it)',
+    )
     args = parser.parse_args()
     src_path = Path(args.epub)
     if not src_path.exists():
@@ -1320,8 +1571,9 @@ def main():
         print(
             'warning: scripts inside the book are allowed to run - only do this for books you trust'
         )
-    else:
-        ReaderHandler.csp = EPUB_CSP
+    if args.allow_remote:
+        print('warning: the book may load content from https:// sites - only for books you trust')
+    ReaderHandler.csp = build_csp(args.allow_scripts, args.allow_remote)
     run_server(ReaderHandler, args.host, args.port, args.no_browser)
 
 

@@ -356,12 +356,90 @@ class SmallHelperTests(unittest.TestCase):
         self.assertIn('café', es.sniff_text(latin))
         self.assertEqual(es.sniff_text(b'caf\xe9'), 'café')  # undeclared, not UTF-8
 
-    def test_first_real_match_skips_comments_cdata_script_style(self):
+    def test_first_real_element_skips_comments_cdata_script_style(self):
         text = (
-            '<!-- <title>no</title> --><script>"<title>no</title>"</script>'
+            '<!-- <title>no</title> --><![CDATA[<title>no</title>]]>'
+            '<script>"<title>no</title>"</script><SCRIPT type="x">1</SCRIPT >'
             '<style>/* <title>no</title> */</style><title>yes</title>'
         )
-        self.assertEqual(es.first_real_match(es.TITLE_RE, text).group(1), 'yes')
+        self.assertEqual(es.first_real_element_text(text, 'title'), 'yes')
+
+    def test_element_lookup_edge_cases(self):
+        T = es.first_real_element_text
+        self.assertEqual(T('<TITLE lang="en">Caps</TITLE>', 'title'), 'Caps')
+        self.assertIsNone(T('<titles>not a title</titles>', 'title'))  # a different element
+        self.assertIsNone(T('<title/>', 'title'))  # empty
+        self.assertIsNone(T('<title>never closed', 'title'))
+        self.assertIsNone(T('<p>nothing here</p>', 'title'))
+        # A self-closed <script/> must not swallow the real title after it.
+        self.assertEqual(T('<script src="a.js"/><title>seen</title>', 'title'), 'seen')
+        # An unterminated comment runs to the end of the text, as in a browser.
+        self.assertIsNone(T('<!-- oops <title>hidden</title>', 'title'))
+
+    def test_skipped_spans(self):
+        text = 'a<!--x-->b<![CDATA[y]]>c<script>z</script>d'
+        self.assertEqual(
+            [text[s:e] for s, e in es.skipped_spans(text)],
+            ['<!--x-->', '<![CDATA[y]]>', '<script>z</script>'],
+        )
+        self.assertEqual(
+            [text[s:e] for s, e in es.skipped_spans(text, comments_only=True)],
+            ['<!--x-->', '<![CDATA[y]]>'],
+        )
+        self.assertEqual(es.skipped_spans('<!-- open'), [(0, 9)])
+
+    def test_first_real_tag_finds_body_outside_comments(self):
+        text = '<!-- <body class="fake"> --><head/><body class="real">'
+        self.assertEqual(es.first_real_tag(text, 'body').group(0), '<body class="real">')
+        self.assertIsNone(es.first_real_tag('<!-- <body> -->', 'body'))
+
+    def test_parse_xml_refuses_entity_declarations(self):
+        bomb = (
+            '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "aaaaaaaaaa">'
+            '<!ENTITY b "&a;&a;&a;&a;">]><x>&b;</x>'
+        )
+        for payload in (bomb, bomb.encode(), bomb.encode('utf-16-le'), bomb.encode('utf-16-be')):
+            with self.assertRaises(es.ET.ParseError):
+                es.parse_xml(payload)
+        # A DOCTYPE that only points at the XHTML DTD is perfectly normal and still parses.
+        ok = (
+            b'<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
+            b'"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd"><html xmlns="x"/>'
+        )
+        self.assertEqual(es.parse_xml(ok).tag, '{x}html')
+        self.assertFalse(es.is_wellformed_xhtml(bomb))
+
+    def test_printable_neutralises_control_characters(self):
+        self.assertEqual(es.printable('/a\x1b[31m\r\nb'), '/a\\x1b[31m\\x0d\\x0ab')
+        self.assertEqual(es.printable('x' * 300), 'x' * 200 + '...')
+
+    def test_host_header_names(self):
+        H = es.host_header_name
+        self.assertEqual(H('localhost:8000'), 'localhost')
+        self.assertEqual(H('LOCALHOST'), 'localhost')
+        self.assertEqual(H('127.0.0.1:9'), '127.0.0.1')
+        self.assertEqual(H('[::1]:8000'), '::1')
+        self.assertEqual(H('localhost.:80'), 'localhost')
+        self.assertEqual(H('evil.example:80'), 'evil.example')
+
+    def test_allowed_host_names_only_for_loopback_binds(self):
+        self.assertIn('localhost', es.allowed_host_names('127.0.0.1'))
+        self.assertIn('127.0.0.1', es.allowed_host_names('localhost'))
+        self.assertIn('127.0.0.2', es.allowed_host_names('127.0.0.2'))
+        self.assertIsNone(es.allowed_host_names('0.0.0.0'))
+        self.assertIsNone(es.allowed_host_names('192.168.1.5'))
+
+    def test_build_csp(self):
+        default = es.build_csp()
+        self.assertIn("script-src 'none'", default)
+        self.assertIn("default-src 'self' data:", default)
+        self.assertNotIn('https:', default)
+        self.assertIn("frame-ancestors 'none'", default)
+        scripts = es.build_csp(allow_scripts=True)
+        self.assertNotIn("script-src 'none'", scripts)
+        self.assertIn("'unsafe-inline'", scripts.split('script-src')[1])
+        self.assertIn('https:', es.build_csp(allow_remote=True))
+        self.assertEqual(es.EPUB_CSP, default)
 
     def test_resolve_href(self):
         self.assertEqual(
@@ -575,17 +653,44 @@ class EpubServerTests(TempDirCase):
 
     # -- scripts ------------------------------------------------------------
 
-    def test_csp_blocks_scripts_by_default_on_every_response(self):
+    def test_csp_blocks_scripts_and_remote_content_on_every_response(self):
         for path in ('/', '/book/OEBPS/c1.xhtml', '/book/OEBPS/img/pic.png', '/book/OEBPS/nope'):
             r = self.srv.get(path)
-            self.assertEqual(r.headers.get('content-security-policy'), "script-src 'none'", path)
+            policy = r.headers.get('content-security-policy', '')
+            self.assertEqual(policy, es.EPUB_CSP, path)
+            self.assertIn("script-src 'none'", policy)
+            self.assertIn("default-src 'self' data:", policy)
 
-    def test_csp_absent_when_scripts_are_allowed(self):
+    def test_no_csp_header_when_the_handler_has_no_policy(self):
         srv = Running(quiet_handler(es.ReaderHandler, book=self.book, csp=None))
         try:
             self.assertNotIn('content-security-policy', srv.get('/book/OEBPS/c1.xhtml').headers)
         finally:
             srv.close()
+
+    def test_security_headers_on_every_kind_of_response(self):
+        url = '/book/OEBPS/media/clip.mp4'
+        responses = [
+            self.srv.get('/'),  # index
+            self.srv.get('/book/OEBPS/c1.xhtml'),  # chapter
+            self.srv.get('/book/OEBPS/img/pic.png'),  # buffered image
+            self.srv.get(url),  # streamed
+            self.srv.get(url, {'Range': 'bytes=999999-'}),  # 416
+            self.srv.get('/book/OEBPS/c1.xhtml', {'If-None-Match': '*'}),  # 304
+            self.srv.get('/book/OEBPS/missing'),  # 404
+            self.srv.get('/book/OEBPS/drm.xhtml'),  # 403
+            self.srv.request('POST', '/'),  # 501 generated by the standard library
+        ]
+        self.assertEqual(
+            [r.status for r in responses], [200, 200, 200, 200, 416, 304, 404, 403, 501]
+        )
+        for r in responses:
+            self.assertEqual(r.headers.get('x-content-type-options'), 'nosniff', r.status)
+            self.assertEqual(r.headers.get('referrer-policy'), 'no-referrer', r.status)
+            self.assertEqual(r.headers.get('cross-origin-resource-policy'), 'same-origin', r.status)
+            self.assertEqual(r.headers.get('content-security-policy'), es.EPUB_CSP, r.status)
+            # sent once, not twice
+            self.assertNotIn(',', r.headers['x-content-type-options'])
 
     # -- streaming ----------------------------------------------------------
 
@@ -1032,28 +1137,198 @@ class PdfTests(TempDirCase):
 # ---------------------------------------------------------------------------
 
 
+class HardeningTests(TempDirCase):
+    """Hostile inputs: nothing here may hang, leak, or bypass a protection."""
+
+    def test_scanners_stay_fast_on_pathological_input(self):
+        import time
+
+        for hostile in ('<!--' * 100000, '<body' * 100000, '<![CDATA[' * 50000, '<' * 300000):
+            start = time.monotonic()
+            es.first_real_element_text(hostile, 'title')
+            es.first_real_tag(hostile, 'body')
+            self.assertLess(time.monotonic() - start, 3, hostile[:10])
+
+    def test_drm_cannot_be_bypassed_by_an_alternate_unicode_spelling(self):
+        files = main_epub_files()
+        path = write_epub(self.tmp / 'nfd.epub', files)
+        book, _ = load_book(path)
+        self.assertTrue(book.is_drm('OEBPS/drm.xhtml'))
+        accent = 'OEBPS/café.xhtml'
+        for form in ('NFC', 'NFD'):
+            self.assertEqual(
+                book._key(unicodedata.normalize(form, accent)), book._key(accent), form
+            )
+
+    def test_drm_chapter_in_nfd_spelling_is_still_refused(self):
+        files = main_epub_files()
+        enc = files['META-INF/encryption.xml'].decode()
+        files['OEBPS/café2.xhtml'] = CHAPTER_DRM.encode()
+        files['META-INF/encryption.xml'] = enc.replace(
+            'OEBPS/drm.xhtml', unicodedata.normalize('NFC', 'OEBPS/café2.xhtml')
+        ).encode()
+        files.pop('OEBPS/drm.xhtml')
+        book, _ = load_book(write_epub(self.tmp / 'nfd2.epub', files))
+        for form in ('NFC', 'NFD'):
+            self.assertTrue(book.is_drm(unicodedata.normalize(form, 'OEBPS/café2.xhtml')), form)
+
+    def test_entity_declarations_in_xml_are_refused(self):
+        bomb = b'<?xml version="1.0"?><!DOCTYPE a [<!ENTITY x "y">]><a>&x;</a>'
+        with self.assertRaises(Exception):
+            es.parse_xml(bomb)
+        files = main_epub_files()
+        files['OEBPS/content.opf'] = bomb
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(Exception):
+                es.Book(es.open_source(write_epub(self.tmp / 'bomb.epub', files)))
+
+    def test_extracted_folder_never_serves_hidden_files(self):
+        folder = self.tmp / 'hiddenbook'
+        for name, data in main_epub_files().items():
+            target = folder / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        (folder / 'OEBPS' / '.secret.txt').write_text('top secret')
+        (folder / '.git').mkdir()
+        (folder / '.git' / 'config').write_text('token')
+        book, _ = load_book(folder)
+        srv = Running(quiet_handler(es.ReaderHandler, book=book, csp=es.EPUB_CSP))
+        self.addCleanup(srv.close)
+        self.assertEqual(srv.get('/book/OEBPS/.secret.txt').status, 404)
+        self.assertEqual(srv.get('/book/.git/config').status, 404)
+        self.assertEqual(srv.get('/book/OEBPS/style.css').status, 200)
+
+    def test_foreign_host_header_is_refused_when_hosts_are_restricted(self):
+        book, _ = load_book(write_epub(self.tmp / 'host.epub', main_epub_files()))
+        srv = Running(
+            quiet_handler(
+                es.ReaderHandler,
+                book=book,
+                csp=es.EPUB_CSP,
+                allowed_hosts=es.allowed_host_names('127.0.0.1'),
+            )
+        )
+        self.addCleanup(srv.close)
+        self.assertEqual(srv.get('/', {'Host': 'localhost:1'}).status, 200)
+        self.assertEqual(srv.get('/', {'Host': '127.0.0.1'}).status, 200)
+        self.assertEqual(srv.get('/', {'Host': 'evil.example'}).status, 403)
+
+    def test_internal_errors_do_not_leak_details(self):
+        book, _ = load_book(write_epub(self.tmp / 'boom.epub', main_epub_files()))
+
+        def boom(*args, **kwargs):
+            raise RuntimeError('SECRET-PATH /etc/shadow')
+
+        book.read_resource = boom
+        srv = Running(quiet_handler(es.ReaderHandler, book=book, csp=es.EPUB_CSP))
+        self.addCleanup(srv.close)
+        with contextlib.redirect_stderr(io.StringIO()):
+            r = srv.get('/book/OEBPS/style.css')
+        self.assertEqual(r.status, 500)
+        self.assertNotIn(b'SECRET', r.body)
+        self.assertNotIn(b'Traceback', r.body)
+
+    def test_huge_range_numbers_are_ignored_not_fatal(self):
+        self.assertIsNone(es.parse_byte_range('bytes=' + '9' * 5000 + '-', 100))
+        self.assertIsNone(es.parse_byte_range('bytes=0-' + '9' * 5000, 100))
+
+    def test_deeply_nested_toc_is_capped(self):
+        depth = es.MAX_TOC_DEPTH * 20
+        ncx = (
+            '<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><navMap>'
+            + '<navPoint><navLabel><text>t</text></navLabel><content src="c1.xhtml"/>' * depth
+            + '</navPoint>' * depth
+            + '</navMap></ncx>'
+        )
+        files = main_epub_files()
+        files['OEBPS/toc.ncx'] = ncx.encode()
+        files['OEBPS/nav.xhtml'] = b'<html><body/></html>'
+        manifest = [m for m in MAIN_MANIFEST if m[0] != 'nav'] + [
+            ('ncx', 'toc.ncx', 'application/x-dtbncx+xml', '')
+        ]
+        files['OEBPS/content.opf'] = make_opf(manifest, MAIN_SPINE, ncx_id='ncx').encode()
+        with contextlib.redirect_stderr(io.StringIO()):
+            book, _ = load_book(write_epub(self.tmp / 'deep.epub', files))
+        self.assertTrue(book.spine)
+
+    def test_pdf_library_skips_symlinks_out_of_root_and_non_regular_files(self):
+        root = self.tmp / 'pdflib'
+        root.mkdir()
+        outside = self.tmp / 'outside.pdf'
+        outside.write_bytes(b'%PDF-1.4 secret')
+        (root / 'ok.pdf').write_bytes(b'%PDF-1.4 fine')
+        os.symlink(outside, root / 'link.pdf')
+        if hasattr(os, 'mkfifo'):
+            os.mkfifo(root / 'pipe.pdf')
+        lib = es.PdfLibrary(root)
+        names = [e.name if hasattr(e, 'name') else str(e) for e in lib.scan()]
+        joined = ' '.join(names)
+        self.assertIn('ok.pdf', joined)
+        self.assertNotIn('link.pdf', joined)
+        self.assertNotIn('pipe.pdf', joined)
+
+    def test_pdf_handler_has_security_headers_without_corp(self):
+        root = self.tmp / 'pdfhdr'
+        root.mkdir()
+        (root / 'a.pdf').write_bytes(b'%PDF-1.4 x')
+        lib = es.PdfLibrary(root)
+        srv = Running(quiet_handler(es.PdfHandler, library=lib))
+        self.addCleanup(srv.close)
+        page = srv.get('/')
+        self.assertEqual(page.headers.get('x-content-type-options'), 'nosniff')
+        self.assertNotIn('cross-origin-resource-policy', page.headers)
+
+
 class CommandLineTests(TempDirCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.epub = write_epub(cls.tmp / 'book.epub', main_epub_files())
 
-    def test_scripts_are_blocked_by_default(self):
-        cli = Cli(self.epub)
-        try:
-            r = cli.get('/book/OEBPS/c1.xhtml')
-        finally:
-            cli.stop()
-        self.assertEqual(r.headers.get('content-security-policy'), "script-src 'none'")
-
-    def test_allow_scripts_flag_lifts_the_policy_and_warns(self):
-        cli = Cli(self.epub, '--allow-scripts')
+    def policy_for(self, *flags):
+        cli = Cli(self.epub, *flags)
         try:
             r = cli.get('/book/OEBPS/c1.xhtml')
         finally:
             out, err = cli.stop()
-        self.assertNotIn('content-security-policy', r.headers)
+        return r.headers.get('content-security-policy', ''), out, err
+
+    def test_scripts_and_remote_content_are_blocked_by_default(self):
+        policy, out, _ = self.policy_for()
+        self.assertEqual(policy, es.build_csp())
+        self.assertNotIn('warning: scripts', out)
+
+    def test_allow_scripts_flag_permits_scripts_and_warns(self):
+        policy, out, _ = self.policy_for('--allow-scripts')
+        self.assertEqual(policy, es.build_csp(allow_scripts=True))
+        self.assertNotIn("script-src 'none'", policy)
+        self.assertNotIn('https:', policy)  # remote content is a separate switch
         self.assertIn('scripts inside the book are allowed', out)
+
+    def test_allow_remote_flag_permits_https_content_and_warns(self):
+        policy, out, _ = self.policy_for('--allow-remote')
+        self.assertEqual(policy, es.build_csp(allow_remote=True))
+        self.assertIn("script-src 'none'", policy)  # still no scripts
+        self.assertIn('https:// sites', out)
+
+    def test_loopback_server_refuses_foreign_host_headers(self):
+        cli = Cli(self.epub)
+        try:
+            ok = cli.get('/', {'Host': f'localhost:{cli.port}'})
+            rebinding = cli.get('/', {'Host': f'attacker.example:{cli.port}'})
+        finally:
+            cli.stop()
+        self.assertEqual(ok.status, 200)
+        self.assertEqual(rebinding.status, 403)
+        self.assertNotIn(b'Test Book', rebinding.body)
+
+    def test_listening_on_all_interfaces_warns(self):
+        cli = Cli(self.epub, '--host', '0.0.0.0')
+        try:
+            cli.get('/')
+        finally:
+            out, err = cli.stop()
+        self.assertIn('anyone who can reach this machine', err)
 
     def test_epub_startup_output_and_no_tracebacks(self):
         cli = Cli(self.epub)

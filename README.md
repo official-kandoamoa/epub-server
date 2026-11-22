@@ -54,6 +54,19 @@ single `.pdf`, or a whole folder of them.
 - **In-page reading nav bar** — contents / prev / next / chapter title /
   position — injected into each chapter.
 
+- **Safe by default with untrusted books** — a book is untrusted input, so
+  every response carries a Content-Security-Policy that blocks scripts,
+  remote resources, forms and framing, plus `nosniff`, `no-referrer` and
+  same-origin resource headers. Use `--allow-scripts` / `--allow-remote` only
+  for books you trust (each prints a startup warning). See [Security](#security).
+- **Fast and cached** — chapters are rendered once and kept in a size-bounded
+  cache; responses carry `ETag`s so reloads get `304 Not Modified`. Large
+  media is streamed from the zip with HTTP Range support instead of being
+  loaded into memory (in-memory files are capped at 32 MB). Chapter titles
+  for the fallback contents list are read lazily, not all at startup.
+- **Loud, not silent** — problems such as an unreadable `encryption.xml` or a
+  broken table of contents print a warning on stderr instead of being ignored.
+
 ## Requirements
 
 - Python 3.7 or later.
@@ -76,6 +89,8 @@ This starts a local server and opens your browser to it automatically.
 | `--host HOST`  | `127.0.0.1`   | Host/interface to bind to                                  |
 | `--no-browser` | off           | Don't automatically open a browser tab                    |
 | `--verbose`    | off           | Log every request (failed requests are always logged)     |
+| `--allow-scripts` | off        | Let JavaScript inside the book run (blocked by default)   |
+| `--allow-remote`  | off        | Let the book load images/styles/etc. from `https://` sites (blocked by default) |
 
 ### Examples
 
@@ -153,6 +168,36 @@ new tab" or "Download" links in the viewer's top bar.
   `--verbose` to see every request.
 - **"Address already in use"** — another copy (or another program) is on that
   port. Pick a different one with `--port`.
+
+## Security
+
+- Scripts, remote content, `<form>` submission and framing are blocked by the
+  CSP unless you opt in with `--allow-scripts` / `--allow-remote`. With
+  `--allow-scripts` the other restrictions stay in force.
+- When bound to a loopback address (the default), requests whose `Host`
+  header isn't `localhost`/`127.0.0.1`/`::1` get `403`, which defeats DNS
+  rebinding attacks from web pages in your browser. Binding to `0.0.0.0` or
+  another address turns this check off and prints a warning: anyone who can
+  reach the port can read the book or PDFs.
+- XML with `<!ENTITY>` declarations is refused (entity-expansion bombs);
+  parsing of titles/bodies uses linear-time scanners, so hostile files
+  can't stall the server; table-of-contents nesting is capped.
+- DRM detection can't be sidestepped with alternate Unicode/zip spellings of
+  a protected file's name.
+- Extracted folders never serve dotfiles or dot-folders (`.git`, `.env`, ...),
+  and nothing outside the book's folder is reachable.
+- PDF libraries skip symlinks that point outside the folder and anything that
+  isn't a regular file; only files found by a scan can be requested.
+- Internal errors return a generic `500`; details go to the terminal only.
+  Logged paths have control characters neutralised. Idle connections time out.
+
+## Tests
+
+```
+python -m unittest discover -s tests -v
+```
+
+Standard library only; the suite starts real servers on free local ports.
 
 ## How it works
 
