@@ -243,6 +243,11 @@ class ZipSource:
             except KeyError:
                 return name
 
+    def list_names(self):
+        """Every file entry (not folders)."""
+        with self._lock:
+            return [n for n in self._zf.namelist() if not n.endswith('/')]
+
     def find_opf_names(self):
         """Every .opf entry, shallowest first (the fallback when container.xml is no help)."""
         with self._lock:
@@ -309,6 +314,19 @@ class DirSource:
             raise FileNotFoundError(name) from exc
         return f, st.st_size, f'{st.st_mtime_ns:x}-{st.st_size:x}'
 
+    def list_names(self, limit=50000):
+        """Every regular file inside the folder (hidden folders and files skipped)."""
+        names = []
+        for dirpath, dirnames, filenames in os.walk(self._root):
+            dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+            for f in filenames:
+                rel = Path(dirpath, f).relative_to(self._root).as_posix()
+                if not f.startswith('.') and self.exists(rel):
+                    names.append(rel)
+            if len(names) > limit:
+                break
+        return names
+
     def find_opf_names(self, limit=20000):
         """Every .opf file in the folder (hidden folders skipped), shallowest first."""
         found, seen = [], 0
@@ -339,7 +357,11 @@ class DirSource:
 
 def open_source(path):
     path = Path(path)
-    return DirSource(path) if path.is_dir() else ZipSource(path)
+    source = DirSource(path) if path.is_dir() else ZipSource(path)
+    source.label = (
+        path.name if path.is_dir() else path.stem
+    )  # used as the title of a book with no OPF
+    return source
 
 
 def sniff_text(raw):
@@ -450,6 +472,14 @@ def _has_entity_declaration(data):
     return any(sig in data for sig in _ENTITY_DECL_SIGNATURES)
 
 
+LOOSE_PAGE_EXTENSIONS = ('.html', '.htm', '.xhtml')
+
+
+def natural_sort_key(name):
+    """Sort by name with numbers in order: page2 before page10, case-insensitive."""
+    return [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', name.lower())] + [name]
+
+
 def parse_xml(data):
     """ET.fromstring for files that come out of an untrusted book.
 
@@ -529,7 +559,10 @@ class Book:
     def __init__(self, source):
         self.source = source
         self.opf_dir, self.opf_path = self._find_opf()
-        self._parse_opf()
+        if self.opf_path is None:
+            self._parse_loose_pages()
+        else:
+            self._parse_opf()
         obfuscated, drm = self._parse_encryption()
         # Keyed by canonical name, so asking for a protected file under a different (but
         # equivalent) Unicode spelling can't slip past the DRM check or skip de-obfuscation.
@@ -571,10 +604,34 @@ class Book:
             problem = 'META-INF/container.xml does not point to a package file that exists'
         candidates = self.source.find_opf_names()
         if not candidates:
-            raise ValueError(f'{problem}, and no .opf package file was found - not a valid EPUB')
+            self._opf_problem = f'{problem}, and no .opf package file was found'
+            return '', None
         full_path = candidates[0]
         warn(f'{problem}; using {full_path} instead')
         return posixpath.dirname(full_path), full_path
+
+    def _parse_loose_pages(self):
+        """No package file at all: serve every .html/.htm/.xhtml file, sorted by name.
+
+        There is no metadata, manifest or table of contents, so the title is the file or
+        folder name, and the contents page is a flat list of the pages' own titles."""
+        pages = sorted(
+            (
+                n
+                for n in self.source.list_names()
+                if n.lower().endswith(LOOSE_PAGE_EXTENSIONS) and not n.startswith('META-INF/')
+            ),
+            key=natural_sort_key,
+        )
+        if not pages:
+            raise ValueError(
+                f'{self._opf_problem}, and no .html/.htm/.xhtml pages were found - '
+                'not a valid EPUB'
+            )
+        warn(f'{self._opf_problem}; listing the {len(pages)} HTML page(s) by name instead')
+        self.title = getattr(self.source, 'label', '') or 'Untitled'
+        self.authors, self.language, self.identifier = [], None, None
+        self.manifest, self.spine, self._toc_ref, self._cover_candidate = {}, pages, None, None
 
     def _parse_opf(self):
         root = parse_xml(self.source.read(self.opf_path))
@@ -1638,7 +1695,9 @@ def main():
     except Exception as exc:
         sys.exit(f'error: could not parse EPUB structure: {exc}')
     print(f'"{book.title}"' + (f' by {", ".join(book.authors)}' if book.authors else ''))
-    print(f'{len(book.spine)} chapters, OPF at {book.opf_path}')
+    print(
+        f'{len(book.spine)} chapters, ' + (f'OPF at {book.opf_path}' if book.opf_path else 'no OPF')
+    )
     if book.toc:
         print(f'table of contents: {len(book.toc)} top-level entries')
     if book.obfuscated_fonts:

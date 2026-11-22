@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import io
 import os
+import posixpath
 import socket
 import subprocess
 import sys
@@ -1307,13 +1308,26 @@ class ReviewFollowUpTests(TempDirCase):
         self.assertEqual(book.opf_path, 'OEBPS/content.opf')
         self.assertEqual(err, '')
 
-    def test_no_opf_anywhere_means_not_an_epub(self):
+    def test_no_opf_anywhere_falls_back_to_listing_the_pages(self):
         for as_folder in (False, True):
-            with contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaisesRegex(ValueError, 'no .opf package file was found'):
-                    self._book_with_container(
-                        f'noopf{as_folder}', None, drop=('OEBPS/content.opf',), as_folder=as_folder
-                    )
+            book, err = self._book_with_container(
+                f'noopf{as_folder}', None, drop=('OEBPS/content.opf',), as_folder=as_folder
+            )
+            self.assertIsNone(book.opf_path)
+            self.assertIn('no .opf package file was found', err)
+            names = [posixpath.basename(unicodedata.normalize('NFC', p)) for p in book.spine]
+            self.assertEqual(
+                names,
+                [
+                    'big.xhtml',
+                    'c1.xhtml',
+                    'c2.xhtml',
+                    'c3.html',
+                    'café.xhtml',
+                    'drm.xhtml',
+                    'nav.xhtml',
+                ],
+            )
 
     def test_opf_search_prefers_the_shallowest_and_skips_hidden_folders(self):
         folder = self.tmp / 'search'
@@ -1323,6 +1337,54 @@ class ReviewFollowUpTests(TempDirCase):
         (folder / 'deep' / 'er' / 'z.opf').write_text('x')
         (folder / 'deep' / 'm.OPF').write_text('x')
         self.assertEqual(es.DirSource(folder).find_opf_names(), ['deep/m.OPF', 'deep/er/z.opf'])
+
+    def test_no_opf_lists_html_pages_sorted_by_name(self):
+        files = {
+            'page10.html': b'<html><head><title>Ten</title></head><body><p>ten</p></body></html>',
+            'Page2.HTM': b'<html><body><h1>Two</h1></body></html>',
+            'sub/a.xhtml': b'<html xmlns="http://www.w3.org/1999/xhtml"><body>a</body></html>',
+            'style.css': b'p{color:red}',
+            'notes.txt': b'skip me',
+            'META-INF/skip.html': b'<html><body>no</body></html>',
+        }
+        for as_folder in (False, True):
+            name = f'loose{as_folder}'
+            if as_folder:
+                folder = self.tmp / name
+                for n, data in files.items():
+                    (folder / n).parent.mkdir(parents=True, exist_ok=True)
+                    (folder / n).write_bytes(data)
+                src = folder
+            else:
+                src = write_epub(self.tmp / f'{name}.epub', files)
+            book, err = load_book(src)
+            self.assertEqual(book.spine, ['Page2.HTM', 'page10.html', 'sub/a.xhtml'])
+            self.assertEqual(book.title, name if as_folder else name)
+            self.assertIn('listing the 3 HTML page(s) by name', err)
+            self.assertEqual(book.toc, [])
+            index = es.make_index_html(book)
+            for title in ('Two', 'Ten'):
+                self.assertIn(title, index)
+            self.assertLess(index.index('Two'), index.index('Ten'))
+            srv = Running(quiet_handler(es.ReaderHandler, book=book, csp=es.build_csp()))
+            self.addCleanup(srv.close)
+            r = srv.get('/book/page10.html')
+            self.assertEqual(r.status, 200)
+            self.assertIn(b'__reader_nav', r.body)
+            self.assertEqual(srv.get('/book/style.css').status, 200)
+
+    def test_no_opf_and_no_pages_means_not_an_epub(self):
+        path = write_epub(self.tmp / 'nothing.epub', {'a.txt': b'x', 'b.png': b'x'})
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, 'no .html/.htm/.xhtml pages were found'):
+                es.Book(es.open_source(path))
+
+    def test_natural_sort_key(self):
+        names = ['p10.html', 'P2.html', 'p1.html', 'a/p1.html']
+        self.assertEqual(
+            sorted(names, key=es.natural_sort_key),
+            ['a/p1.html', 'p1.html', 'P2.html', 'p10.html'],
+        )
 
     def test_folder_with_pdfs_and_an_opf_is_still_an_epub(self):
         folder = self.tmp / 'mixed'
