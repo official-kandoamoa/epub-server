@@ -35,7 +35,17 @@ Usage:
     python epub_server.py ./folder-of-pdfs
 """
 
+import sys
+
+if sys.version_info < (3, 7):  # checked before anything newer than 3.6 is imported or used
+    sys.exit(
+        'error: epub_server.py needs Python 3.7 or newer '
+        f'(this is {sys.version_info[0]}.{sys.version_info[1]}). Install a newer Python and run '
+        'it with that, e.g. "python3.11 epub_server.py book.epub".'
+    )
+
 import argparse
+import errno
 import hashlib
 import html
 import html.entities as html_entities
@@ -44,19 +54,19 @@ import os
 import posixpath
 import re
 import stat
-import sys
 import threading
 import traceback
 import unicodedata
 import webbrowser
 import zipfile
+import zlib
 import bisect
 import socket
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 from xml.etree import ElementTree as ET
 
 CONTAINER_NS = {'c': 'urn:oasis:names:tc:opendocument:xmlns:container'}
@@ -135,7 +145,6 @@ def build_csp(allow_scripts=False, allow_remote=False):
     )
 
 
-EPUB_CSP = build_csp()
 LOOPBACK_NAMES = {'localhost', '127.0.0.1', '::1'}
 
 
@@ -178,6 +187,15 @@ class ResourceTooLargeError(Exception):
         self.name, self.size, self.limit = name, size, limit
 
 
+class UnsupportedContentError(Exception):
+    """An entry this tool can't read (a password-protected zip entry, an unsupported
+    compression method), as opposed to one that is missing or DRM-protected."""
+
+    def __init__(self, name, reason):
+        super().__init__(f'{name}: {reason}')
+        self.name, self.reason = name, reason
+
+
 def _check_size(name, size):
     if size > MAX_INMEMORY_BYTES:
         raise ResourceTooLargeError(name, size, MAX_INMEMORY_BYTES)
@@ -217,12 +235,22 @@ class ZipSource:
                 return False
             return True
 
+    @staticmethod
+    def _unsupported(name, exc):
+        """The error for an entry the zip library can't open, in plain words."""
+        if isinstance(exc, NotImplementedError):
+            return UnsupportedContentError(name, f'unsupported zip compression ({exc})')
+        return UnsupportedContentError(name, 'password-protected zip entry')
+
     def read(self, name):
         """The whole entry as bytes (refuses entries bigger than MAX_INMEMORY_BYTES)."""
         with self._lock:
             info = self._resolve(name)
             _check_size(name, info.file_size)
-            return self._zf.read(info)
+            try:
+                return self._zf.read(info)
+            except (NotImplementedError, RuntimeError) as exc:  # RuntimeError: encrypted
+                raise self._unsupported(name, exc) from exc
 
     def open(self, name):
         """Open an entry for streaming: (file object, size, validator).
@@ -231,7 +259,10 @@ class ZipSource:
         validator changes whenever the entry's content does (used for ETags)."""
         with self._lock:
             info = self._resolve(name)
-            f = self._zf.open(info)
+            try:
+                f = self._zf.open(info)
+            except (NotImplementedError, RuntimeError) as exc:
+                raise self._unsupported(name, exc) from exc
         return f, info.file_size, f'{info.CRC:08x}-{info.file_size:x}'
 
     def canonical(self, name):
@@ -242,6 +273,17 @@ class ZipSource:
                 return self._resolve(name).filename
             except KeyError:
                 return name
+
+    def list_names(self):
+        """Every file entry (not folders)."""
+        with self._lock:
+            return [n for n in self._zf.namelist() if not n.endswith('/')]
+
+    def find_opf_names(self):
+        """Every .opf entry, shallowest first (the fallback when container.xml is no help)."""
+        with self._lock:
+            names = [n for n in self._zf.namelist() if n.lower().endswith('.opf')]
+        return sorted(names, key=lambda n: (n.count('/'), n.lower()))
 
     def _find_alt_name(self, name):
         alt = self._by_nfc.get(unicodedata.normalize('NFC', name))
@@ -303,6 +345,34 @@ class DirSource:
             raise FileNotFoundError(name) from exc
         return f, st.st_size, f'{st.st_mtime_ns:x}-{st.st_size:x}'
 
+    def list_names(self, limit=50000):
+        """Every regular file inside the folder (hidden folders and files skipped)."""
+        names = []
+        for dirpath, dirnames, filenames in os.walk(self._root):
+            dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+            for f in filenames:
+                rel = Path(dirpath, f).relative_to(self._root).as_posix()
+                if not f.startswith('.') and self.exists(rel):
+                    names.append(rel)
+            if len(names) > limit:
+                break
+        return names
+
+    def find_opf_names(self, limit=20000):
+        """Every .opf file in the folder (hidden folders skipped), shallowest first."""
+        found, seen = [], 0
+        for dirpath, dirnames, filenames in os.walk(self._root):
+            dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+            for f in filenames:
+                seen += 1
+                if f.lower().endswith('.opf') and not f.startswith('.'):
+                    rel = Path(dirpath, f).relative_to(self._root).as_posix()
+                    if self.exists(rel):  # regular file inside the root, not a symlink escape
+                        found.append(rel)
+            if seen > limit:
+                break
+        return sorted(found, key=lambda n: (n.count('/'), n.lower()))
+
     @staticmethod
     def canonical(name):
         return name
@@ -318,7 +388,11 @@ class DirSource:
 
 def open_source(path):
     path = Path(path)
-    return DirSource(path) if path.is_dir() else ZipSource(path)
+    source = DirSource(path) if path.is_dir() else ZipSource(path)
+    source.label = (
+        path.name if path.is_dir() else path.stem
+    )  # used as the title of a book with no OPF
+    return source
 
 
 def sniff_text(raw):
@@ -429,6 +503,14 @@ def _has_entity_declaration(data):
     return any(sig in data for sig in _ENTITY_DECL_SIGNATURES)
 
 
+LOOSE_PAGE_EXTENSIONS = ('.html', '.htm', '.xhtml')
+
+
+def natural_sort_key(name):
+    """Sort by name with numbers in order: page2 before page10, case-insensitive."""
+    return [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', name.lower())] + [name]
+
+
 def parse_xml(data):
     """ET.fromstring for files that come out of an untrusted book.
 
@@ -508,7 +590,12 @@ class Book:
     def __init__(self, source):
         self.source = source
         self.opf_dir, self.opf_path = self._find_opf()
-        self._parse_opf()
+        if self.opf_path is not None:  # a loose folder of pages was never meant to be an EPUB
+            self._check_mimetype_entry()
+        if self.opf_path is None:
+            self._parse_loose_pages()
+        else:
+            self._parse_opf()
         obfuscated, drm = self._parse_encryption()
         # Keyed by canonical name, so asking for a protected file under a different (but
         # equivalent) Unicode spelling can't slip past the DRM check or skip de-obfuscation.
@@ -527,12 +614,105 @@ class Book:
             self.toc = []
 
     def _find_opf(self):
-        root = parse_xml(self.source.read('META-INF/container.xml'))
-        rootfile = root.find('.//c:rootfile', CONTAINER_NS)
-        if rootfile is None:
-            raise ValueError('container.xml has no <rootfile> - not a valid EPUB')
-        full_path, _ = resolve_href(rootfile.get('full-path'), '')
+        """Where the package (.opf) file is: (its folder, its path).
+
+        container.xml is the proper source. If it is missing, unreadable, or points at a
+        file that isn't there, look for an .opf file directly (and say so). If there is
+        none at all, this isn't a usable book."""
+        problem = None
+        try:
+            root = parse_xml(self.source.read('META-INF/container.xml'))
+        except (KeyError, FileNotFoundError):
+            problem = 'META-INF/container.xml is missing'
+        except Exception as exc:  # unparseable, too large, entity declarations...
+            problem = f'META-INF/container.xml is unusable ({printable(str(exc))})'
+        else:
+            for rootfile in root.findall('.//c:rootfile', CONTAINER_NS):
+                href = rootfile.get('full-path')
+                if not href:
+                    continue
+                full_path, _ = resolve_href(href, '')
+                if self.source.exists(full_path):
+                    return posixpath.dirname(full_path), full_path
+            problem = 'META-INF/container.xml does not point to a package file that exists'
+        candidates = self.source.find_opf_names()
+        if not candidates:
+            self._opf_problem = f'{problem}, and no .opf package file was found'
+            return '', None
+        full_path = candidates[0]
+        warn(f'{problem}; using {full_path} instead')
         return posixpath.dirname(full_path), full_path
+
+    def _check_mimetype_entry(self):
+        """Some readers refuse an EPUB whose 'mimetype' entry is missing or wrong; this one
+        doesn't, but the book's author would want to know."""
+        try:
+            declared = self.source.read('mimetype').strip()
+        except (KeyError, FileNotFoundError, UnsupportedContentError, ResourceTooLargeError):
+            warn("the book has no 'mimetype' file; strict EPUB readers may refuse it")
+            return
+        if declared != b'application/epub+zip':
+            warn(
+                "the book's 'mimetype' file does not say application/epub+zip; strict readers may refuse it"
+            )
+
+    def _check_package_compatibility(self, root, manifest, spine):
+        """Warn about things that are legal but won't look or work as the author intended here."""
+        version = (root.get('version') or '').strip()
+        if not version:
+            warn('the package file declares no EPUB version; assuming it is EPUB 2 or 3')
+        elif version.split('.')[0] not in ('2', '3'):
+            warn(
+                f'EPUB version {version} is not one this tool knows (2.x and 3.x); '
+                'some features may not display'
+            )
+        for meta in root.findall('.//opf:metadata/opf:meta', OPF_NS):
+            if (
+                meta.get('property') == 'rendition:layout'
+                and (meta.text or '').strip() == 'pre-paginated'
+            ):
+                warn(
+                    'this is a fixed-layout book: pages are positioned exactly, so the reading '
+                    'bar may overlap content and text may not reflow'
+                )
+                break
+        by_path = {mi.href: mi for mi in manifest.values()}
+        odd = [
+            p
+            for p in spine
+            if by_path.get(p)
+            and not by_path[p].media_type.startswith(
+                ('application/xhtml', 'text/html', 'text/x-oeb1-document', 'application/x-dtbook')
+            )
+        ]
+        if odd:
+            warn(
+                f'{len(odd)} reading-order item(s) are not HTML pages (images or SVG, for '
+                f'example, such as {odd[0]}); they are served as they are, without the reading bar'
+            )
+
+    def _parse_loose_pages(self):
+        """No package file at all: serve every .html/.htm/.xhtml file, sorted by name.
+
+        There is no metadata, manifest or table of contents, so the title is the file or
+        folder name, and the contents page is a flat list of the pages' own titles."""
+        pages = sorted(
+            (
+                n
+                for n in self.source.list_names()
+                if n.lower().endswith(LOOSE_PAGE_EXTENSIONS) and not n.startswith('META-INF/')
+            ),
+            key=natural_sort_key,
+        )
+        if not pages:
+            raise ValueError(
+                f'{self._opf_problem}, and no .html/.htm/.xhtml pages were found - '
+                'not a valid EPUB'
+            )
+        warn(f'{self._opf_problem}; listing the {len(pages)} HTML page(s) by name instead')
+        self.title = getattr(self.source, 'label', '') or 'Untitled'
+        self.authors, self.language, self.identifier = [], None, None
+        self.manifest, self.spine, self._toc_ref, self._cover_candidate = {}, pages, None, None
 
     def _parse_opf(self):
         root = parse_xml(self.source.read(self.opf_path))
@@ -590,6 +770,7 @@ class Book:
                 mi = manifest.get(meta_cover.get('content', ''))
                 if mi:
                     cover = mi.href
+        self._check_package_compatibility(root, manifest, spine)
         self.title = titles[0] if titles else 'Untitled'
         self.authors, self.language, self.identifier = (
             texts('creator'),
@@ -678,16 +859,23 @@ class Book:
     def _parse_nav_toc(self, nav_path):
         root, base_dir = parse_xml(self.source.read(nav_path)), posixpath.dirname(nav_path)
         toc_nav = None
-        for nav in _find_descendants(root, 'nav', XHTML_NS_URI):
+        navs = _find_descendants(root, 'nav', XHTML_NS_URI)
+        for nav in navs:
             t = nav.get(f'{{{EPUB_OPS_NS_URI}}}type', '') or nav.get('type', '')
             if 'toc' in t.split():
                 toc_nav = nav
                 break
-        navs = _find_descendants(root, 'nav', XHTML_NS_URI)
         if toc_nav is None and navs:
             toc_nav = navs[0]  # no epub:type="toc" found - best guess
         ol = _find_child(toc_nav, 'ol', XHTML_NS_URI) if toc_nav is not None else None
         return self._parse_nav_ol(ol, base_dir) if ol is not None else []
+
+    def _warn_toc_truncated(self):
+        if not getattr(self, '_toc_truncated_warned', False):
+            self._toc_truncated_warned = True
+            warn(
+                f'table of contents nests deeper than {MAX_TOC_DEPTH} levels; deeper entries dropped'
+            )
 
     def _parse_nav_ol(self, ol, base_dir, depth=0):
         entries = []
@@ -705,6 +893,8 @@ class Book:
             ):
                 path, frag = resolve_href(a.get('href'), base_dir)
             child = _find_child(li, 'ol', XHTML_NS_URI)
+            if child is not None and depth >= MAX_TOC_DEPTH:
+                self._warn_toc_truncated()
             children = (
                 self._parse_nav_ol(child, base_dir, depth + 1)
                 if child is not None and depth < MAX_TOC_DEPTH
@@ -729,6 +919,8 @@ class Book:
             path = frag = ''
             if content is not None and content.get('src'):
                 path, frag = resolve_href(content.get('src'), base_dir)
+            if depth >= MAX_TOC_DEPTH and _find_children(np, 'navPoint', NCX_NS_URI):
+                self._warn_toc_truncated()
             children = (
                 self._parse_navpoints(np, base_dir, depth + 1) if depth < MAX_TOC_DEPTH else []
             )
@@ -748,13 +940,24 @@ class Book:
         if text is None:
             try:
                 text = sniff_text(self.read_resource(path))
-            except (KeyError, FileNotFoundError, DrmProtectedError, ResourceTooLargeError):
+            except (
+                KeyError,
+                FileNotFoundError,
+                DrmProtectedError,
+                ResourceTooLargeError,
+                UnsupportedContentError,
+                zipfile.BadZipFile,
+                zlib.error,
+            ):
                 text = None
         if text is not None:
             text = text[:TITLE_SCAN_CHARS]
-            inner = first_real_element_text(text, 'title') or first_real_element_text(text, 'h1')
-            if inner is not None:
-                title = html.unescape(TAG_RE.sub('', inner)).strip()
+            for name in ('title', 'h1'):  # a blank <title> falls through to the <h1>
+                inner = first_real_element_text(text, name)
+                clean = html.unescape(TAG_RE.sub('', inner)).strip() if inner is not None else ''
+                if clean:
+                    title = clean
+                    break
         self._titles[path] = title
         return title
 
@@ -795,7 +998,8 @@ def make_link(path, fragment=''):
 
 
 def make_nav_bar(book, current_path, text=None):
-    idx = book.spine.index(current_path) if current_path in book.spine else -1
+    keys = [book._key(p) for p in book.spine]  # same spelling rules as DRM checks (NFC etc.)
+    idx = keys.index(book._key(current_path)) if book._key(current_path) in keys else -1
     prev = f'<a href="{make_link(book.spine[idx-1])}">&#8592; Prev</a>' if idx > 0 else ''
     nxt = (
         f'<a href="{make_link(book.spine[idx+1])}">Next &#8594;</a>'
@@ -847,7 +1051,7 @@ def render_flat_list(book):
     )
 
 
-def make_index_html(book):
+def make_index_html(book, notice=None):
     toc = render_toc_entries(book.toc, book) if book.toc else render_flat_list(book)
     author = (
         f'<p class="byline">by {html.escape(", ".join(book.authors))}</p>' if book.authors else ''
@@ -863,9 +1067,120 @@ def make_index_html(book):
     title = html.escape(book.title)
     return (
         f'<!DOCTYPE html><html{direction}><head>{HTML_META}'
-        f'<title>{title}</title><style>{INDEX_CSS}</style></head>'
-        f'<body>{cover}<h1>{title}</h1>{author}{drm}{toc}</body></html>'
+        f'<title>{title}</title><style>{INDEX_CSS}{COMPAT_CSS}</style></head>'
+        f'<body>{compat_banner(notice)}{cover}<h1>{title}</h1>{author}{drm}{toc}</body></html>'
     )
+
+
+# ---------------------------------------------------------------------------
+# Browser compatibility
+# ---------------------------------------------------------------------------
+
+# The oldest browser versions the pages here are known to be fine in. The reading bar needs
+# flexbox `gap` and `position: sticky`; these are the first releases with both.
+MIN_BROWSER_VERSIONS = {
+    'Chrome': 84,
+    'Edge': 84,
+    'Firefox': 78,
+    'Safari': 14,
+    'Opera': 70,
+    'Samsung Internet': 14,
+}
+MIN_IOS_VERSION = 14
+
+# Programs that fetch pages without being a browser: never shown a browser warning.
+_TOOL_AGENT_RE = re.compile(
+    r'curl|wget|python|urllib|http[._-]?client|bot\b|spider|crawl|libwww|go-http|okhttp|java/|'
+    r'postman|insomnia|httpie',
+    re.IGNORECASE,
+)
+_IOS_RE = re.compile(r'\b(iPhone|iPad|iPod)\b.*?\bOS (\d+)[_.]', re.IGNORECASE)
+# (token in the User-Agent, name shown, regex capturing the version), most specific first.
+_BROWSER_TOKENS = (
+    ('Edg/', 'Edge', r'Edg/(\d+)'),
+    ('EdgA/', 'Edge', r'EdgA/(\d+)'),
+    ('EdgiOS/', 'Edge', r'EdgiOS/(\d+)'),
+    ('OPR/', 'Opera', r'OPR/(\d+)'),
+    ('SamsungBrowser/', 'Samsung Internet', r'SamsungBrowser/(\d+)'),
+    ('Firefox/', 'Firefox', r'Firefox/(\d+)'),
+    ('FxiOS/', 'Firefox', r'FxiOS/(\d+)'),
+    ('Chrome/', 'Chrome', r'Chrome/(\d+)'),
+    ('CriOS/', 'Chrome', r'CriOS/(\d+)'),
+    ('Safari/', 'Safari', r'Version/(\d+)'),
+)
+_PDF_INLINE_TROUBLE_RE = re.compile(r'Android|iPhone|iPad|iPod|Mobile|Silk|Kindle', re.IGNORECASE)
+
+
+def assess_browser(user_agent, for_pdf=False):
+    """A short heads-up for browsers this reader may not work well in, or None.
+
+    A User-Agent can be wrong or missing, so this only ever *advises*: the page is
+    served in full either way. Programs that are not browsers (curl, scripts, crawlers),
+    and requests with no User-Agent at all, get no message."""
+    ua = (user_agent or '').strip()[:500]
+    if not ua or _TOOL_AGENT_RE.search(ua):
+        return None
+    notes = []
+    ios = _IOS_RE.search(ua)
+    if 'MSIE ' in ua or 'Trident/' in ua:
+        notes.append(
+            'Internet Explorer is too old to show this page properly '
+            '(a current Edge, Chrome, Firefox or Safari is recommended)'
+        )
+    elif re.search(r'\bEdge/\d', ua):
+        notes.append(
+            'This is the old, pre-2020 Microsoft Edge, which is too old for this page '
+            '(update Edge, or use Chrome or Firefox)'
+        )
+    elif ios and int(ios.group(2)) < MIN_IOS_VERSION:
+        notes.append(
+            f'This iPhone/iPad runs iOS {ios.group(2)}, older than the iOS {MIN_IOS_VERSION} '
+            'this page is known to work in'
+        )
+    else:
+        for token, name, version_re in _BROWSER_TOKENS:
+            if token in ua:
+                found = re.search(version_re, ua)
+                version = int(found.group(1)) if found else None
+                minimum = MIN_BROWSER_VERSIONS[name]
+                if ios and name != 'Safari':
+                    break  # on iOS every browser is built on Safari; iOS version decides above
+                if version is not None and version < minimum:
+                    notes.append(
+                        f'Your browser ({name} {version}) is older than {name} {minimum}, '
+                        'the oldest this page is known to work in'
+                    )
+                break
+        else:
+            notes.append(
+                "This browser isn't one this page has been tested with"
+                if ua.startswith('Mozilla/')
+                else 'This looks like an unusual or text-mode browser'
+            )
+    if for_pdf and _PDF_INLINE_TROUBLE_RE.search(ua):
+        notes.append(
+            'phones and tablets often cannot show a PDF inside a page (some show only the '
+            'first page) - if it looks wrong, use "Open in new tab" or "Download"'
+        )
+    if for_pdf and ('MSIE ' in ua or 'Trident/' in ua):
+        notes.append('it has no built-in PDF viewer, so use "Download"')
+    if not notes:
+        return None
+    text = '; '.join(notes)
+    return text[0].upper() + text[1:] + '. Some things may not work, but you can keep going.'
+
+
+COMPAT_CSS = (
+    '.compat{background:#fff4d6;color:#4a3800;border:1px solid #e0b84a;border-radius:6px;'
+    'padding:10px 14px;margin:12px 0;font:14px/1.4 sans-serif}'
+)
+
+
+def compat_banner(notice):
+    """The heads-up box for `notice` (plain text, or None for no box)."""
+    if not notice:
+        return ''
+    return f'<div class="compat" role="note"><strong>Heads-up:</strong> {html.escape(notice)}</div>'
 
 
 HTML_META = (
@@ -1002,6 +1317,7 @@ def etag_matches(header, etag):
 def printable(text, limit=200):
     """`text` made safe to print: control characters (a terminal escape sequence in a
     request path, say) are shown as \\xNN, and it is cut off at `limit` characters."""
+    text = '-' if text is None else str(text)  # e.g. no request method when the line was garbage
     shown = ''.join(c if c.isprintable() else f'\\x{ord(c):02x}' for c in text[:limit])
     return shown + ('...' if len(text) > limit else '')
 
@@ -1011,11 +1327,12 @@ class ReaderHandler(BaseHTTPRequestHandler):
     verbose = False
     csp = None  # Content-Security-Policy to send with every response, if set
     chapter_cache = None  # ByteLRU of processed chapters, if set
+    for_pdf = False  # whether entry pages host PDFs (changes the browser heads-up)
     allowed_hosts = None  # accepted Host header names (DNS-rebinding defence), if set
     timeout = 60  # seconds a client may stall on the socket before its connection is dropped
     security_headers = {
         'X-Content-Type-Options': 'nosniff',
-        'Referrer-Policy': 'no-referrer',
+        'Referrer-Policy': 'same-origin',  # lets failed requests name the page that asked
         # Other sites can't embed this server's files (images, media, ...) into their pages.
         'Cross-Origin-Resource-Policy': 'same-origin',
     }
@@ -1032,7 +1349,22 @@ class ReaderHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             failed = False
         if self.verbose or failed:
-            print(f'{code} {self.command} {printable(self.path)}', file=sys.stderr)
+            line = f'{code} {printable(self.command)} {printable(getattr(self, "path", None))}'
+            source = self._referring_page() if failed else None
+            if source:
+                line += f'  (requested by {source})'
+            print(line, file=sys.stderr)
+
+    def _referring_page(self):
+        """The page of ours that asked for this URL, from the Referer header, if any."""
+        headers = getattr(self, 'headers', None)  # absent if the request line itself was bad
+        referer = headers.get('Referer') if headers else None
+        if not referer:
+            return None
+        parts = urlsplit(referer)
+        if parts.netloc.lower() != (headers.get('Host') or '').strip().lower():
+            return None  # not one of our own pages: don't repeat what an outside site sent
+        return printable(unquote(parts.path), 120) or None
 
     def end_headers(self):
         # Every response gets these - including the ones the standard library generates for
@@ -1072,7 +1404,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
     def _route(self):
         path = self.path.split('?', 1)[0]
         if path == '/':
-            self._send(200, make_index_html(self.book).encode(), 'text/html; charset=utf-8')
+            self._send_entry_page(lambda notice: make_index_html(self.book, notice))
         elif path.startswith('/book/'):
             self._serve_epub_file(self.book.resolve(path[6:]))
         else:
@@ -1113,6 +1445,9 @@ class ReaderHandler(BaseHTTPRequestHandler):
             return
         except ResourceTooLargeError as exc:
             self._send(413, f'Too large to show: {exc}'.encode(), 'text/plain; charset=utf-8')
+            return
+        except UnsupportedContentError as exc:
+            self._send(415, f'Cannot be shown: {exc}'.encode(), 'text/plain; charset=utf-8')
             return
         if buffered:
             self._send_buffered(epub_path, lower, is_text, fetched)
@@ -1175,16 +1510,27 @@ class ReaderHandler(BaseHTTPRequestHandler):
         for name, value in (extra_headers or {}).items():
             self.send_header(name, value)
 
+    def _send_entry_page(self, make_html):
+        """Send an entry page (contents, PDF library or viewer). It may carry a browser
+        heads-up, so it varies with the User-Agent and caches are told so."""
+        notice = assess_browser(self.headers.get('User-Agent'), for_pdf=self.for_pdf)
+        self._send(
+            200,
+            make_html(notice).encode(),
+            'text/html; charset=utf-8',
+            extra_headers={'Vary': 'User-Agent', 'Cache-Control': 'no-cache'},
+        )
+
     def _send_not_modified(self, etag):
         self.send_response(304)
         self._send_common_headers(etag)
         self.end_headers()
 
-    def _send(self, status, body, ctype, etag=None):
+    def _send(self, status, body, ctype, etag=None, extra_headers=None):
         self.send_response(status)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(body)))
-        self._send_common_headers(etag)
+        self._send_common_headers(etag, extra_headers)
         self.end_headers()
         if not self._head_only:
             self.wfile.write(body)
@@ -1232,6 +1578,10 @@ class ReaderHandler(BaseHTTPRequestHandler):
                     remaining -= len(chunk)
             except (BrokenPipeError, ConnectionResetError):
                 pass  # the browser closed the tab or seeked elsewhere
+            except Exception as exc:  # corrupt zip entry, disk error...
+                # The headers are already out, so a 500 can't follow: report and drop the connection.
+                warn(f'stream failed part-way: {printable(repr(exc))}')
+                self.close_connection = True
 
 
 # ---------------------------------------------------------------------------
@@ -1254,6 +1604,7 @@ PDF_CSS = (
     '#bar a:hover{text-decoration:underline}'
     '#bar .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:0 1 auto}'
     '#bar .sp{flex:1 1 auto}'
+    'body.viewer .compat{margin:0;border-radius:0;border-width:0 0 1px}'
     'object{flex:1 1 auto;width:100%;border:0}'
     'object p{padding:16px}'
 )
@@ -1297,6 +1648,7 @@ class PdfLibrary:
         self.root = Path(path).resolve()
         self.single = self.root.is_file()
         self._by_id = {}
+        self._scan_lock = threading.Lock()
 
     def is_inside(self, path):
         """Whether `path`, with symlinks followed, still lies within the served folder."""
@@ -1312,8 +1664,11 @@ class PdfLibrary:
         """The entry with this id: from the last scan, else (a PDF added since) a fresh one."""
         entry = self._by_id.get(entry_id)
         if entry is None:
-            self.scan()
-            entry = self._by_id.get(entry_id)
+            with self._scan_lock:  # concurrent misses share one rescan
+                entry = self._by_id.get(entry_id)
+                if entry is None:
+                    self.scan()
+                    entry = self._by_id.get(entry_id)
         return entry
 
     def scan(self):
@@ -1384,7 +1739,7 @@ def content_disposition(kind, filename):
     return f'{kind}; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded}'
 
 
-def make_pdf_library_html(entries):
+def make_pdf_library_html(entries, notice=None):
     if entries:
         items = ''.join(
             f'<li><a href="/view/{e.id}">{html.escape(e.name)}</a>'
@@ -1397,19 +1752,19 @@ def make_pdf_library_html(entries):
         body = '<p>No PDF files found.</p>'
     return (
         f'<!DOCTYPE html><html><head>{HTML_META}'
-        f'<title>PDF library</title><style>{PDF_CSS}</style></head>'
-        f'<body><h1>PDF library</h1>{body}</body></html>'
+        f'<title>PDF library</title><style>{PDF_CSS}{COMPAT_CSS}</style></head>'
+        f'<body>{compat_banner(notice)}<h1>PDF library</h1>{body}</body></html>'
     )
 
 
-def make_pdf_viewer_html(entry, show_back):
+def make_pdf_viewer_html(entry, show_back, notice=None):
     title = html.escape(entry.title)
     back = '<a href="/">&#8962; Library</a>' if show_back else ''
     src, dl = f'/pdf/{entry.id}', f'/dl/{entry.id}'
     return (
         f'<!DOCTYPE html><html><head>{HTML_META}'
-        f'<title>{title}</title><style>{PDF_CSS}</style></head><body class="viewer">'
-        f'<div id="bar">{back}<span class="t" title="{title}">{title}</span>'
+        f'<title>{title}</title><style>{PDF_CSS}{COMPAT_CSS}</style></head><body class="viewer">'
+        f'{compat_banner(notice)}<div id="bar">{back}<span class="t" title="{title}">{title}</span>'
         f'<span class="sp"></span>'
         f'<a href="{src}" target="_blank">Open in new tab</a>'
         f'<a href="{dl}">Download</a></div>'
@@ -1422,6 +1777,7 @@ def make_pdf_viewer_html(entry, show_back):
 
 class PdfHandler(ReaderHandler):
     library = None
+    for_pdf = True
     csp = None  # PDFs are shown by the browser's own viewer; a script policy would get in its way
     # No Cross-Origin-Resource-Policy here: some browsers fetch a PDF for their built-in
     # viewer in a way that header can break.
@@ -1432,24 +1788,17 @@ class PdfHandler(ReaderHandler):
         if path == '/':
             entries = self.library.scan()
             if self.library.single and entries:
-                self._send(
-                    200,
-                    make_pdf_viewer_html(entries[0], show_back=False).encode(),
-                    'text/html; charset=utf-8',
-                )
+                self._send_entry_page(lambda n: make_pdf_viewer_html(entries[0], False, n))
             else:
-                self._send(200, make_pdf_library_html(entries).encode(), 'text/html; charset=utf-8')
+                self._send_entry_page(lambda n: make_pdf_library_html(entries, n))
             return
         m = PDF_URL_RE.fullmatch(path)
         entry = self.library.find(m.group(2)) if m else None
         if entry is None:
             self._send(404, b'Not found', 'text/plain; charset=utf-8')
         elif m.group(1) == 'view':
-            self._send(
-                200,
-                make_pdf_viewer_html(entry, show_back=not self.library.single).encode(),
-                'text/html; charset=utf-8',
-            )
+            show_back = not self.library.single
+            self._send_entry_page(lambda n: make_pdf_viewer_html(entry, show_back, n))
         else:
             self._send_pdf(entry, 'attachment' if m.group(1) == 'dl' else 'inline')
 
@@ -1478,6 +1827,26 @@ class PdfHandler(ReaderHandler):
         )
 
 
+def foreign_format(path):
+    """The name of a well-known non-EPUB format this file is in, judged by its first bytes."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(70)
+    except OSError:
+        return None
+    if head[60:68] in (b'BOOKMOBI', b'TEXtREAd'):
+        return 'a Kindle/Mobipocket (MOBI/AZW) book'
+    if head.startswith(b'ITSF'):
+        return 'a CHM help file'
+    if head.startswith(b'AT&TFORM'):
+        return 'a DjVu document'
+    if head.startswith((b'Rar!', b'7z\xbc\xaf', b'\x1f\x8b')):
+        return 'a compressed archive (extract it first, then point this at the folder)'
+    if head.lstrip().startswith(b'<?xml') and b'FictionBook' in head:
+        return 'an FB2 book'
+    return None
+
+
 def detect_mode(path):
     """'pdf' for a PDF file or a folder of PDFs, otherwise 'epub'."""
     if path.is_file():
@@ -1485,6 +1854,7 @@ def detect_mode(path):
     if (
         path.is_dir()
         and not (path / 'META-INF' / 'container.xml').is_file()
+        and not DirSource(path).find_opf_names()
         and PdfLibrary(path).scan()
     ):
         return 'pdf'
@@ -1499,13 +1869,28 @@ def run_server(handler, host, port, no_browser):
             'can read everything being served'
         )
     try:
-        server = QuietThreadingHTTPServer((host, port), handler)
+        server_class = QuietThreadingHTTPServer
+        if ':' in host:  # an IPv6 address such as ::1
+            server_class = type(
+                'QuietThreadingHTTPServerV6',
+                (QuietThreadingHTTPServer,),
+                {'address_family': socket.AF_INET6},
+            )
+        server = server_class((host, port), handler)
+    except socket.gaierror as exc:
+        sys.exit(f'error: {host!r} is not an address this machine can listen on ({exc.strerror})')
     except OSError as exc:
+        if exc.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+            sys.exit(
+                f'error: this machine cannot listen on {host} ({exc.strerror or exc}). '
+                'Is it an address this machine has (IPv6 may be switched off)? '
+                'Try 127.0.0.1, or 0.0.0.0 for every IPv4 interface.'
+            )
         sys.exit(
             f'error: could not listen on {host}:{port} ({exc.strerror or exc}). '
             'Is another copy already running? Try a different --port.'
         )
-    url = f'http://{host}:{port}/'
+    url = f'http://[{host}]:{port}/' if ':' in host else f'http://{host}:{port}/'
     print(f'serving at {url}  (Ctrl+C to stop)')
     if not no_browser:
         try:
@@ -1518,6 +1903,17 @@ def run_server(handler, host, port, no_browser):
         print('\nstopped')
 
 
+def port_number(text):
+    """argparse type: a TCP port, 1-65535."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'{text!r} is not a number') from None
+    if not 1 <= value <= 65535:
+        raise argparse.ArgumentTypeError(f'{value} is not a valid port (use 1-65535)')
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1527,7 +1923,7 @@ def main():
         metavar='path',
         help='.epub or .pdf file, or a folder: either extracted epub contents or PDFs to host',
     )
-    parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--port', type=port_number, default=8000)
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument(
         '--no-browser', action='store_true', help="don't try to auto-open a browser tab"
@@ -1549,6 +1945,13 @@ def main():
         '(blocked by default, so a book cannot phone home while you read it)',
     )
     args = parser.parse_args()
+    for stream in (sys.stdout, sys.stderr):
+        # A Windows console in a legacy code page would crash on a title with, say, CJK
+        # characters; show a replacement mark instead.
+        try:
+            stream.reconfigure(errors='replace')
+        except (AttributeError, ValueError):
+            pass
     src_path = Path(args.epub)
     if not src_path.exists():
         sys.exit(f'error: {src_path} not found')
@@ -1562,27 +1965,41 @@ def main():
         return
     try:
         book = Book(open_source(src_path))
+    except zipfile.BadZipFile as exc:
+        other = foreign_format(src_path) if src_path.is_file() else None
+        sys.exit(
+            f'error: {src_path} is not an EPUB'
+            + (
+                f': it looks like {other}. Convert it to EPUB first.'
+                if other
+                else f' - it is not a readable zip file ({exc}). Is the download incomplete?'
+            )
+        )
+    except PermissionError:
+        sys.exit(f'error: no permission to read {src_path}')
+    except (NotImplementedError, UnsupportedContentError) as exc:
+        sys.exit(f'error: this EPUB uses a zip feature that is not supported: {exc}')
+    except OSError as exc:
+        sys.exit(f'error: could not read {src_path}: {exc.strerror or exc}')
     except Exception as exc:
         sys.exit(f'error: could not parse EPUB structure: {exc}')
     print(f'"{book.title}"' + (f' by {", ".join(book.authors)}' if book.authors else ''))
-    print(f'{len(book.spine)} chapters, OPF at {book.opf_path}')
+    print(
+        f'{len(book.spine)} chapters, ' + (f'OPF at {book.opf_path}' if book.opf_path else 'no OPF')
+    )
     if book.toc:
         print(f'table of contents: {len(book.toc)} top-level entries')
     if book.obfuscated_fonts:
         print(f'{len(book.obfuscated_fonts)} obfuscated font(s) will be de-obfuscated on the fly')
     if book.has_drm:
-        print(
-            f'warning: {len(book.drm_paths)} resource(s) are DRM-protected and will not be viewable'
-        )
+        warn(f'{len(book.drm_paths)} resource(s) are DRM-protected and will not be viewable')
     ReaderHandler.book = book
     ReaderHandler.verbose = args.verbose
     ReaderHandler.chapter_cache = ByteLRU(CHAPTER_CACHE_BYTES)
     if args.allow_scripts:
-        print(
-            'warning: scripts inside the book are allowed to run - only do this for books you trust'
-        )
+        warn('scripts inside the book are allowed to run - only do this for books you trust')
     if args.allow_remote:
-        print('warning: the book may load content from https:// sites - only for books you trust')
+        warn('the book may load content from https:// sites - only for books you trust')
     ReaderHandler.csp = build_csp(args.allow_scripts, args.allow_remote)
     run_server(ReaderHandler, args.host, args.port, args.no_browser)
 

@@ -21,6 +21,7 @@ single `.pdf`, or a whole folder of them.
 - **Correct Unicode, always** — accented characters, CJK, emoji, and curly
   quotes decode correctly no matter what encoding the original files
   declared, including CSS `@charset` and legacy non-UTF-8 encodings.
+- **Finds the book even if `container.xml` is wrong** — if `META-INF/container.xml` is missing, broken, or points at a file that doesn't exist, it searches for an `.opf` package file itself (shallowest first, with a warning); if there is none, it serves every `.html`, `.htm` and `.xhtml` file it finds, sorted by name (numbers in order, so `page2` comes before `page10`), with the file or folder name as the title and a contents list built from each page's own title. Only if there are no such pages either does it report that this is not a valid EPUB.
 - **Handles messy real-world zips** — percent-encoded filenames, filenames
   with a different Unicode normalization than the metadata expects (NFC vs
   NFD, common from macOS), and legacy CP437-mangled filenames.
@@ -33,8 +34,8 @@ single `.pdf`, or a whole folder of them.
   automatically fall back to the forgiving HTML parser instead of showing an
   XML error page.
 - **Root-absolute links work** — references like `href="/styles/main.css"`
-  or `src="/OEBPS/images/a.png"` are resolved against the book (package folder
-  first, then the epub root) instead of 404ing.
+  or `src="/OEBPS/images/a.png"` are resolved against the book (the epub root
+  first, then the package folder) instead of 404ing.
 - **Won't be fooled by embedded examples** — a literal `<body>`, `<title>`,
   or `<h1>` shown as example markup inside a comment, CDATA section, or a
   `<script>`/`<style>` block (common in programming and web-dev books) is
@@ -56,16 +57,40 @@ single `.pdf`, or a whole folder of them.
 
 - **Safe by default with untrusted books** — a book is untrusted input, so
   every response carries a Content-Security-Policy that blocks scripts,
-  remote resources, forms and framing, plus `nosniff`, `no-referrer` and
+  remote resources, forms and framing, plus `nosniff`, a same-origin-only referrer policy and
   same-origin resource headers. Use `--allow-scripts` / `--allow-remote` only
   for books you trust (each prints a startup warning). See [Security](#security).
 - **Fast and cached** — chapters are rendered once and kept in a size-bounded
   cache; responses carry `ETag`s so reloads get `304 Not Modified`. Large
   media is streamed from the zip with HTTP Range support instead of being
   loaded into memory (in-memory files are capped at 32 MB). Chapter titles
-  for the fallback contents list are read lazily, not all at startup.
+  for the fallback contents list (books with no table of contents) are read
+  on first use, not at startup; the first visit to the index page reads each
+  chapter once, then the titles are remembered.
 - **Loud, not silent** — problems such as an unreadable `encryption.xml` or a
   broken table of contents print a warning on stderr instead of being ignored.
+
+- **Compatibility checks, in plain words** — instead of a traceback, you get a
+  clear message (and the book still opens where it can) for: a Python older
+  than 3.7; a file that isn't a readable zip (with a hint if it is really a
+  Kindle/MOBI, CHM, FB2, DjVu or archive file); password-protected or
+  unsupported-compression zip entries (shown as `415 Cannot be shown`);
+  missing or wrong `mimetype` file; unknown or missing EPUB version;
+  fixed-layout books; reading-order items that are images/SVG rather than
+  HTML; invalid `--port` values; and listen addresses this machine can't use.
+  IPv6 addresses such as `--host ::1` are supported. Non-ASCII titles never
+  crash a console that can't display them.
+
+- **Browser heads-up** — if your browser looks too old (older than Chrome/Edge
+  84, Firefox 78, Safari/iOS 14, Opera 70, Samsung Internet 14; any Internet
+  Explorer or pre-2020 Edge), or isn't one it recognises, the contents page
+  shows a yellow note that things may not work but you can keep going.
+  PDF pages also warn phones and tablets, which often can't show a PDF inside
+  a page, and point to "Open in new tab" / "Download". The warning only
+  advises: pages are always served in full. Scripts and tools such as `curl`,
+  and requests with no User-Agent, are never warned. The browser is guessed
+  from its User-Agent, which can be wrong; the page is marked `Vary:
+  User-Agent`, and chapters themselves are never changed.
 
 ## Requirements
 
@@ -146,6 +171,8 @@ How the path is interpreted:
 
 - A file is treated as a PDF if it ends in `.pdf` or starts with the `%PDF-`
   signature, so a PDF without an extension still works.
+- Inside a folder, only files ending in `.pdf` are listed (extensionless PDFs
+  are only recognised when you pass them as the path itself).
 - A folder is treated as an extracted epub if it contains
   `META-INF/container.xml`; otherwise, if it contains any PDFs, it's treated as
   a PDF library.
@@ -164,7 +191,9 @@ new tab" or "Download" links in the viewer's top bar.
 
 - **A book looks unstyled or has missing images/fonts** — watch the terminal.
   Every failed request is printed (e.g. `404 GET /book/OEBPS/styles/x.css`),
-  which usually points straight at the broken reference inside the book. Use
+  and names the page that asked for it, e.g.
+  `404 GET /book/OEBPS/x.css  (requested by /book/OEBPS/c1.xhtml)`, which
+  usually points straight at the broken reference inside the book. Use
   `--verbose` to see every request.
 - **"Address already in use"** — another copy (or another program) is on that
   port. Pick a different one with `--port`.
