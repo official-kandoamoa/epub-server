@@ -146,6 +146,12 @@ while it runs on your laptop) — only do this on networks you trust:
 python epub_server.py my-book.epub --host 0.0.0.0
 ```
 
+When you use `--host 0.0.0.0`, the terminal prints the links to use:
+`serving at http://localhost:8000/ on this device` and one
+`on your network, open http://192.168.x.x:8000/` line per local address
+(`0.0.0.0` itself is not an address you can visit). In Termux, open those
+links in the phone's browser, or from another device on the same Wi-Fi.
+
 Stop the server with `Ctrl+C`.
 
 ### Hosting PDFs

@@ -1890,8 +1890,22 @@ def run_server(handler, host, port, no_browser):
             f'error: could not listen on {host}:{port} ({exc.strerror or exc}). '
             'Is another copy already running? Try a different --port.'
         )
-    url = f'http://[{host}]:{port}/' if ':' in host else f'http://{host}:{port}/'
-    print(f'serving at {url}  (Ctrl+C to stop)')
+    if host in WILDCARD_HOSTS:
+        # 0.0.0.0 / :: only means "every network connection"; it is not an address to visit.
+        url = f'http://localhost:{port}/'
+        print(f'serving at {url} on this device  (Ctrl+C to stop)')
+        addresses = lan_addresses()
+        for address in addresses:
+            shown = f'[{address}]' if ':' in address else address
+            print(f'on your network, open  http://{shown}:{port}/')
+        if not addresses:
+            print(
+                'on your network, open  http://<this device\'s IP address>:' + str(port) + '/  '
+                "(couldn't work out the address; see your Wi-Fi settings or run `ip a`)"
+            )
+    else:
+        url = f'http://[{host}]:{port}/' if ':' in host else f'http://{host}:{port}/'
+        print(f'serving at {url}  (Ctrl+C to stop)')
     if not no_browser:
         try:
             threading.Timer(0.5, lambda: webbrowser.open(url)).start()
@@ -1901,6 +1915,31 @@ def run_server(handler, host, port, no_browser):
         server.serve_forever()
     except KeyboardInterrupt:
         print('\nstopped')
+
+
+WILDCARD_HOSTS = ('0.0.0.0', '::', '')
+
+
+def lan_addresses():
+    """This machine's local-network IPv4 addresses (best effort; the router-facing one first).
+
+    Nothing is sent: connecting a UDP socket only asks the OS which interface it would use."""
+    found = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(('10.255.255.255', 1))
+            found.append(probe.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        found.extend(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    result = []
+    for address in found:
+        if address not in result and not address.startswith(('127.', '0.', '169.254.')):
+            result.append(address)
+    return result
 
 
 def port_number(text):
