@@ -1051,7 +1051,7 @@ def render_flat_list(book):
     )
 
 
-def make_index_html(book):
+def make_index_html(book, notice=None):
     toc = render_toc_entries(book.toc, book) if book.toc else render_flat_list(book)
     author = (
         f'<p class="byline">by {html.escape(", ".join(book.authors))}</p>' if book.authors else ''
@@ -1067,9 +1067,120 @@ def make_index_html(book):
     title = html.escape(book.title)
     return (
         f'<!DOCTYPE html><html{direction}><head>{HTML_META}'
-        f'<title>{title}</title><style>{INDEX_CSS}</style></head>'
-        f'<body>{cover}<h1>{title}</h1>{author}{drm}{toc}</body></html>'
+        f'<title>{title}</title><style>{INDEX_CSS}{COMPAT_CSS}</style></head>'
+        f'<body>{compat_banner(notice)}{cover}<h1>{title}</h1>{author}{drm}{toc}</body></html>'
     )
+
+
+# ---------------------------------------------------------------------------
+# Browser compatibility
+# ---------------------------------------------------------------------------
+
+# The oldest browser versions the pages here are known to be fine in. The reading bar needs
+# flexbox `gap` and `position: sticky`; these are the first releases with both.
+MIN_BROWSER_VERSIONS = {
+    'Chrome': 84,
+    'Edge': 84,
+    'Firefox': 78,
+    'Safari': 14,
+    'Opera': 70,
+    'Samsung Internet': 14,
+}
+MIN_IOS_VERSION = 14
+
+# Programs that fetch pages without being a browser: never shown a browser warning.
+_TOOL_AGENT_RE = re.compile(
+    r'curl|wget|python|urllib|http[._-]?client|bot\b|spider|crawl|libwww|go-http|okhttp|java/|'
+    r'postman|insomnia|httpie',
+    re.IGNORECASE,
+)
+_IOS_RE = re.compile(r'\b(iPhone|iPad|iPod)\b.*?\bOS (\d+)[_.]', re.IGNORECASE)
+# (token in the User-Agent, name shown, regex capturing the version), most specific first.
+_BROWSER_TOKENS = (
+    ('Edg/', 'Edge', r'Edg/(\d+)'),
+    ('EdgA/', 'Edge', r'EdgA/(\d+)'),
+    ('EdgiOS/', 'Edge', r'EdgiOS/(\d+)'),
+    ('OPR/', 'Opera', r'OPR/(\d+)'),
+    ('SamsungBrowser/', 'Samsung Internet', r'SamsungBrowser/(\d+)'),
+    ('Firefox/', 'Firefox', r'Firefox/(\d+)'),
+    ('FxiOS/', 'Firefox', r'FxiOS/(\d+)'),
+    ('Chrome/', 'Chrome', r'Chrome/(\d+)'),
+    ('CriOS/', 'Chrome', r'CriOS/(\d+)'),
+    ('Safari/', 'Safari', r'Version/(\d+)'),
+)
+_PDF_INLINE_TROUBLE_RE = re.compile(r'Android|iPhone|iPad|iPod|Mobile|Silk|Kindle', re.IGNORECASE)
+
+
+def assess_browser(user_agent, for_pdf=False):
+    """A short heads-up for browsers this reader may not work well in, or None.
+
+    A User-Agent can be wrong or missing, so this only ever *advises*: the page is
+    served in full either way. Programs that are not browsers (curl, scripts, crawlers),
+    and requests with no User-Agent at all, get no message."""
+    ua = (user_agent or '').strip()[:500]
+    if not ua or _TOOL_AGENT_RE.search(ua):
+        return None
+    notes = []
+    ios = _IOS_RE.search(ua)
+    if 'MSIE ' in ua or 'Trident/' in ua:
+        notes.append(
+            'Internet Explorer is too old to show this page properly '
+            '(a current Edge, Chrome, Firefox or Safari is recommended)'
+        )
+    elif re.search(r'\bEdge/\d', ua):
+        notes.append(
+            'This is the old, pre-2020 Microsoft Edge, which is too old for this page '
+            '(update Edge, or use Chrome or Firefox)'
+        )
+    elif ios and int(ios.group(2)) < MIN_IOS_VERSION:
+        notes.append(
+            f'This iPhone/iPad runs iOS {ios.group(2)}, older than the iOS {MIN_IOS_VERSION} '
+            'this page is known to work in'
+        )
+    else:
+        for token, name, version_re in _BROWSER_TOKENS:
+            if token in ua:
+                found = re.search(version_re, ua)
+                version = int(found.group(1)) if found else None
+                minimum = MIN_BROWSER_VERSIONS[name]
+                if ios and name != 'Safari':
+                    break  # on iOS every browser is built on Safari; iOS version decides above
+                if version is not None and version < minimum:
+                    notes.append(
+                        f'Your browser ({name} {version}) is older than {name} {minimum}, '
+                        'the oldest this page is known to work in'
+                    )
+                break
+        else:
+            notes.append(
+                "This browser isn't one this page has been tested with"
+                if ua.startswith('Mozilla/')
+                else 'This looks like an unusual or text-mode browser'
+            )
+    if for_pdf and _PDF_INLINE_TROUBLE_RE.search(ua):
+        notes.append(
+            'phones and tablets often cannot show a PDF inside a page (some show only the '
+            'first page) - if it looks wrong, use "Open in new tab" or "Download"'
+        )
+    if for_pdf and ('MSIE ' in ua or 'Trident/' in ua):
+        notes.append('it has no built-in PDF viewer, so use "Download"')
+    if not notes:
+        return None
+    text = '; '.join(notes)
+    return text[0].upper() + text[1:] + '. Some things may not work, but you can keep going.'
+
+
+COMPAT_CSS = (
+    '.compat{background:#fff4d6;color:#4a3800;border:1px solid #e0b84a;border-radius:6px;'
+    'padding:10px 14px;margin:12px 0;font:14px/1.4 sans-serif}'
+)
+
+
+def compat_banner(notice):
+    """The heads-up box for `notice` (plain text, or None for no box)."""
+    if not notice:
+        return ''
+    return f'<div class="compat" role="note"><strong>Heads-up:</strong> {html.escape(notice)}</div>'
 
 
 HTML_META = (
@@ -1216,6 +1327,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
     verbose = False
     csp = None  # Content-Security-Policy to send with every response, if set
     chapter_cache = None  # ByteLRU of processed chapters, if set
+    for_pdf = False  # whether entry pages host PDFs (changes the browser heads-up)
     allowed_hosts = None  # accepted Host header names (DNS-rebinding defence), if set
     timeout = 60  # seconds a client may stall on the socket before its connection is dropped
     security_headers = {
@@ -1292,7 +1404,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
     def _route(self):
         path = self.path.split('?', 1)[0]
         if path == '/':
-            self._send(200, make_index_html(self.book).encode(), 'text/html; charset=utf-8')
+            self._send_entry_page(lambda notice: make_index_html(self.book, notice))
         elif path.startswith('/book/'):
             self._serve_epub_file(self.book.resolve(path[6:]))
         else:
@@ -1398,16 +1510,27 @@ class ReaderHandler(BaseHTTPRequestHandler):
         for name, value in (extra_headers or {}).items():
             self.send_header(name, value)
 
+    def _send_entry_page(self, make_html):
+        """Send an entry page (contents, PDF library or viewer). It may carry a browser
+        heads-up, so it varies with the User-Agent and caches are told so."""
+        notice = assess_browser(self.headers.get('User-Agent'), for_pdf=self.for_pdf)
+        self._send(
+            200,
+            make_html(notice).encode(),
+            'text/html; charset=utf-8',
+            extra_headers={'Vary': 'User-Agent', 'Cache-Control': 'no-cache'},
+        )
+
     def _send_not_modified(self, etag):
         self.send_response(304)
         self._send_common_headers(etag)
         self.end_headers()
 
-    def _send(self, status, body, ctype, etag=None):
+    def _send(self, status, body, ctype, etag=None, extra_headers=None):
         self.send_response(status)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(body)))
-        self._send_common_headers(etag)
+        self._send_common_headers(etag, extra_headers)
         self.end_headers()
         if not self._head_only:
             self.wfile.write(body)
@@ -1481,6 +1604,7 @@ PDF_CSS = (
     '#bar a:hover{text-decoration:underline}'
     '#bar .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:0 1 auto}'
     '#bar .sp{flex:1 1 auto}'
+    'body.viewer .compat{margin:0;border-radius:0;border-width:0 0 1px}'
     'object{flex:1 1 auto;width:100%;border:0}'
     'object p{padding:16px}'
 )
@@ -1615,7 +1739,7 @@ def content_disposition(kind, filename):
     return f'{kind}; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded}'
 
 
-def make_pdf_library_html(entries):
+def make_pdf_library_html(entries, notice=None):
     if entries:
         items = ''.join(
             f'<li><a href="/view/{e.id}">{html.escape(e.name)}</a>'
@@ -1628,19 +1752,19 @@ def make_pdf_library_html(entries):
         body = '<p>No PDF files found.</p>'
     return (
         f'<!DOCTYPE html><html><head>{HTML_META}'
-        f'<title>PDF library</title><style>{PDF_CSS}</style></head>'
-        f'<body><h1>PDF library</h1>{body}</body></html>'
+        f'<title>PDF library</title><style>{PDF_CSS}{COMPAT_CSS}</style></head>'
+        f'<body>{compat_banner(notice)}<h1>PDF library</h1>{body}</body></html>'
     )
 
 
-def make_pdf_viewer_html(entry, show_back):
+def make_pdf_viewer_html(entry, show_back, notice=None):
     title = html.escape(entry.title)
     back = '<a href="/">&#8962; Library</a>' if show_back else ''
     src, dl = f'/pdf/{entry.id}', f'/dl/{entry.id}'
     return (
         f'<!DOCTYPE html><html><head>{HTML_META}'
-        f'<title>{title}</title><style>{PDF_CSS}</style></head><body class="viewer">'
-        f'<div id="bar">{back}<span class="t" title="{title}">{title}</span>'
+        f'<title>{title}</title><style>{PDF_CSS}{COMPAT_CSS}</style></head><body class="viewer">'
+        f'{compat_banner(notice)}<div id="bar">{back}<span class="t" title="{title}">{title}</span>'
         f'<span class="sp"></span>'
         f'<a href="{src}" target="_blank">Open in new tab</a>'
         f'<a href="{dl}">Download</a></div>'
@@ -1653,6 +1777,7 @@ def make_pdf_viewer_html(entry, show_back):
 
 class PdfHandler(ReaderHandler):
     library = None
+    for_pdf = True
     csp = None  # PDFs are shown by the browser's own viewer; a script policy would get in its way
     # No Cross-Origin-Resource-Policy here: some browsers fetch a PDF for their built-in
     # viewer in a way that header can break.
@@ -1663,24 +1788,17 @@ class PdfHandler(ReaderHandler):
         if path == '/':
             entries = self.library.scan()
             if self.library.single and entries:
-                self._send(
-                    200,
-                    make_pdf_viewer_html(entries[0], show_back=False).encode(),
-                    'text/html; charset=utf-8',
-                )
+                self._send_entry_page(lambda n: make_pdf_viewer_html(entries[0], False, n))
             else:
-                self._send(200, make_pdf_library_html(entries).encode(), 'text/html; charset=utf-8')
+                self._send_entry_page(lambda n: make_pdf_library_html(entries, n))
             return
         m = PDF_URL_RE.fullmatch(path)
         entry = self.library.find(m.group(2)) if m else None
         if entry is None:
             self._send(404, b'Not found', 'text/plain; charset=utf-8')
         elif m.group(1) == 'view':
-            self._send(
-                200,
-                make_pdf_viewer_html(entry, show_back=not self.library.single).encode(),
-                'text/html; charset=utf-8',
-            )
+            show_back = not self.library.single
+            self._send_entry_page(lambda n: make_pdf_viewer_html(entry, show_back, n))
         else:
             self._send_pdf(entry, 'attachment' if m.group(1) == 'dl' else 'inline')
 

@@ -1139,6 +1139,164 @@ class PdfTests(TempDirCase):
 # ---------------------------------------------------------------------------
 
 
+class BrowserCompatibilityTests(TempDirCase):
+    CHROME = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36'
+    AGENTS = {
+        'modern_chrome': CHROME.format(v=120),
+        'old_chrome': CHROME.format(v=70),
+        'modern_edge': CHROME.format(v=120) + ' Edg/120.0.0.0',
+        'legacy_edge': CHROME.format(v=64) + ' Edge/18.19582',
+        'ie11': 'Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko',
+        'ie9': 'Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; Trident/5.0)',
+        'modern_firefox': 'Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0',
+        'old_firefox': 'Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/60.0',
+        'modern_safari': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+        'old_safari': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_6) AppleWebKit/601.7.8 (KHTML, like Gecko) Version/9.1.3 Safari/601.7.8',
+        'iphone': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1',
+        'old_iphone': 'Mozilla/5.0 (iPhone; CPU iPhone OS 12_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.1 Mobile/15E148 Safari/604.1',
+        'ios_chrome': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/120.0.6099.119 Mobile/15E148 Safari/604.1',
+        'android_chrome': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+        'samsung_old': 'Mozilla/5.0 (Linux; Android 9; SM-G960F) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/9.2 Chrome/67.0.3396.87 Mobile Safari/537.36',
+        'mystery': 'Mozilla/5.0 (X11; Linux) NewBrowser/1.0',
+        'text_mode': 'Lynx/2.9.0 libwww-FM/2.14',
+        'opera_mini': 'Opera/9.80 (Android; Opera Mini/36.2.2254/119.132; U; en) Presto/2.12.423 Version/12.16',
+        'curl': 'curl/8.4.0',
+        'script': 'python-requests/2.31',
+        'crawler': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+    }
+
+    def notice(self, name, for_pdf=False):
+        return es.assess_browser(self.AGENTS[name], for_pdf)
+
+    def test_current_browsers_get_no_warning(self):
+        for name in (
+            'modern_chrome',
+            'modern_edge',
+            'modern_firefox',
+            'modern_safari',
+            'iphone',
+            'ios_chrome',
+            'android_chrome',
+        ):
+            self.assertIsNone(self.notice(name), name)
+
+    def test_non_browsers_and_missing_user_agents_get_no_warning(self):
+        for name in ('curl', 'script', 'crawler'):
+            self.assertIsNone(self.notice(name, True), name)
+        self.assertIsNone(es.assess_browser(None))
+        self.assertIsNone(es.assess_browser('   '))
+
+    def test_outdated_browsers_are_named_with_versions(self):
+        self.assertIn('Chrome 70', self.notice('old_chrome'))
+        self.assertIn('Chrome 84', self.notice('old_chrome'))
+        self.assertIn('Firefox 60', self.notice('old_firefox'))
+        self.assertIn('Safari 9', self.notice('old_safari'))
+        self.assertIn('Samsung Internet 9', self.notice('samsung_old'))
+        self.assertIn('iOS 12', self.notice('old_iphone'))
+        self.assertIn('Internet Explorer', self.notice('ie11'))
+        self.assertIn('Internet Explorer', self.notice('ie9'))
+        self.assertIn('old, pre-2020 Microsoft Edge', self.notice('legacy_edge'))
+        for name in ('old_chrome', 'ie11', 'legacy_edge'):
+            self.assertIn('you can keep going', self.notice(name))
+
+    def test_unknown_browsers_get_a_may_not_work_notice(self):
+        self.assertIn("isn't one this page has been tested with", self.notice('mystery'))
+        self.assertIn('unusual or text-mode browser', self.notice('opera_mini'))
+        self.assertIn('unusual or text-mode browser', es.assess_browser('Netsurf/3.10'))
+
+    def test_pdf_pages_add_a_note_for_phones_and_ie(self):
+        for name in ('iphone', 'android_chrome', 'ios_chrome'):
+            self.assertIsNone(self.notice(name, False), name)
+            note = self.notice(name, True)
+            self.assertIn('often cannot show a PDF inside a page', note, name)
+            self.assertIn('Open in new tab', note)
+        self.assertIsNone(self.notice('modern_chrome', True))
+        self.assertIn('no built-in PDF viewer', self.notice('ie11', True))
+
+    def test_the_banner_never_repeats_the_user_agent_and_is_escaped(self):
+        evil = 'Mozilla/5.0 <script>alert(1)</script> Chrome/5.0 evil.example'
+        notice = es.assess_browser(evil)
+        self.assertIn('Chrome 5', notice)
+        self.assertNotIn('<script>', notice)
+        self.assertNotIn('evil.example', notice)
+        self.assertEqual(es.compat_banner(None), '')
+        self.assertNotIn('<b>', es.compat_banner('<b>x</b>'))
+
+    def test_oversized_user_agents_are_handled(self):
+        import time
+
+        start = time.monotonic()
+        # Only the first 500 characters are examined, so this is quick and just "unrecognised".
+        huge = es.assess_browser('Mozilla/5.0 ' + 'a' * 10**6 + ' Chrome/120.0')
+        self.assertLess(time.monotonic() - start, 1)
+        self.assertIn("isn't one this page has been tested with", huge)
+        # a real browser string with the token inside the examined part is still understood
+        self.assertIsNone(es.assess_browser('Mozilla/5.0 Chrome/120.0 ' + 'a' * 10**6))
+
+    def serve_epub(self):
+        book, _ = load_book(write_epub(self.tmp / 'compat.epub', main_epub_files()))
+        srv = Running(quiet_handler(es.ReaderHandler, book=book, csp=es.build_csp()))
+        self.addCleanup(srv.close)
+        return srv
+
+    def test_epub_index_shows_the_warning_only_to_old_or_unknown_browsers(self):
+        srv = self.serve_epub()
+        for name, warned in (
+            ('old_chrome', True),
+            ('ie11', True),
+            ('mystery', True),
+            ('modern_chrome', False),
+            ('curl', False),
+        ):
+            r = srv.get('/', {'User-Agent': self.AGENTS[name]})
+            self.assertEqual(r.status, 200, name)
+            self.assertEqual(b'class="compat"' in r.body, warned, name)
+            self.assertIn(b'Test Book', r.body, name)  # the page itself is always served in full
+        self.assertNotIn(b'class="compat"', srv.get('/').body)  # no User-Agent at all
+
+    def test_warned_pages_vary_by_user_agent_and_chapters_are_never_touched(self):
+        srv = self.serve_epub()
+        index = srv.get('/', {'User-Agent': self.AGENTS['old_chrome']})
+        self.assertEqual(index.headers['vary'], 'User-Agent')
+        self.assertEqual(index.headers['cache-control'], 'no-cache')
+        old = srv.get('/book/OEBPS/c1.xhtml', {'User-Agent': self.AGENTS['ie11']})
+        new = srv.get('/book/OEBPS/c1.xhtml', {'User-Agent': self.AGENTS['modern_chrome']})
+        self.assertEqual(old.body, new.body)
+        self.assertNotIn(b'compat', old.body)
+
+    def serve_pdfs(self, single):
+        root = self.tmp / ('onepdf' if single else 'manypdf')
+        root.mkdir(exist_ok=True)
+        (root / 'a.pdf').write_bytes(b'%PDF-1.4 a')
+        (root / 'b.pdf').write_bytes(b'%PDF-1.4 b')
+        library = es.PdfLibrary(root / 'a.pdf' if single else root)
+        srv = Running(quiet_handler(es.PdfHandler, library=library))
+        self.addCleanup(srv.close)
+        return srv, library
+
+    def test_pdf_pages_warn_phones_and_old_browsers(self):
+        for single in (True, False):
+            srv, library = self.serve_pdfs(single)
+            pages = ['/'] if single else ['/', '/view/' + library.scan()[0].id]
+            for page in pages:
+                phone = srv.get(page, {'User-Agent': self.AGENTS['android_chrome']})
+                self.assertIn(b'often cannot show a PDF', phone.body, page)
+                self.assertIn(b'Open in new tab', phone.body, page)
+                self.assertEqual(phone.headers['vary'], 'User-Agent')
+                ie = srv.get(page, {'User-Agent': self.AGENTS['ie11']})
+                self.assertIn(b'no built-in PDF viewer', ie.body, page)
+                desktop = srv.get(page, {'User-Agent': self.AGENTS['modern_chrome']})
+                self.assertNotIn(b'class="compat"', desktop.body, page)
+
+    def test_pdf_files_themselves_are_unaffected_by_the_user_agent(self):
+        srv, library = self.serve_pdfs(False)
+        entry = library.scan()[0]
+        a = srv.get(f'/pdf/{entry.id}', {'User-Agent': self.AGENTS['ie11']})
+        b = srv.get(f'/pdf/{entry.id}', {'User-Agent': self.AGENTS['modern_chrome']})
+        self.assertEqual(a.body, b.body)
+        self.assertNotIn('vary', a.headers)
+
+
 class CompatibilityTests(TempDirCase):
     """Things that are legal but unusual, or that this tool can't read, are reported plainly."""
 

@@ -81,6 +81,17 @@ single `.pdf`, or a whole folder of them.
   IPv6 addresses such as `--host ::1` are supported. Non-ASCII titles never
   crash a console that can't display them.
 
+- **Browser heads-up** — if your browser looks too old (older than Chrome/Edge
+  84, Firefox 78, Safari/iOS 14, Opera 70, Samsung Internet 14; any Internet
+  Explorer or pre-2020 Edge), or isn't one it recognises, the contents page
+  shows a yellow note that things may not work but you can keep going.
+  PDF pages also warn phones and tablets, which often can't show a PDF inside
+  a page, and point to "Open in new tab" / "Download". The warning only
+  advises: pages are always served in full. Scripts and tools such as `curl`,
+  and requests with no User-Agent, are never warned. The browser is guessed
+  from its User-Agent, which can be wrong; the page is marked `Vary:
+  User-Agent`, and chapters themselves are never changed.
+
 ## Requirements
 
 - Python 3.7 or later.
