@@ -1957,6 +1957,11 @@ CONFIG_TEMPLATE = """\
 
 [server]
 
+# Apply this file automatically whenever you run the script without --config, e.g. just
+#   python3 epub_server.py        (or: uv run epub_server.py)
+# With "no" (or this line missing) the file is only used when you pass --config FILE.
+auto_apply_custom_settings = yes
+
 # Who can open it:
 #   only-me  - only this device (the default)
 #   share    - any device on the same Wi-Fi/network (there is no password: trusted networks only)
@@ -1981,11 +1986,13 @@ CONFIG_TEMPLATE = """\
 # allow_scripts = no
 # allow_remote = no
 
-# A book, PDF or folder to serve when none is given on the command line.
+# A book, PDF or folder to serve when none is given on the command line, so that
+# running the script with no arguments opens the book you want.
 # A relative path is relative to this file's folder.  ~ means your home folder.
 # path = ~/Books/my-book.epub
 """
 CONFIG_KEYS = (
+    'auto_apply_custom_settings',
     'access',
     'host',
     'port',
@@ -1995,6 +2002,13 @@ CONFIG_KEYS = (
     'allow_remote',
     'path',
 )
+
+
+# Other spellings accepted for a setting name (after lower-casing and '-' -> '_').
+CONFIG_ALIASES = {
+    'auto_apply_settings': 'auto_apply_custom_settings',
+    'auto_apply': 'auto_apply_custom_settings',
+}
 
 
 class ConfigError(ValueError):
@@ -2039,13 +2053,15 @@ def read_config(path):
     except UnicodeDecodeError:
         raise ConfigError('is not UTF-8 text') from None
     parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=('#',))
-    parser.optionxform = lambda key: key.strip().lower().replace('-', '_')
+    parser.optionxform = lambda key: CONFIG_ALIASES.get(
+        key.strip().lower().replace('-', '_'), key.strip().lower().replace('-', '_')
+    )
     try:
         parser.read_string(text, source=path.name)
     except configparser.MissingSectionHeaderError:
         raise ConfigError('must start with a [server] line before the settings') from None
     except configparser.Error as exc:
-        raise ConfigError(str(exc).replace('\n', ' ').strip()) from None
+        raise ConfigError(f'is not valid settings text ({" ".join(str(exc).split())})') from None
     unknown_sections = [name for name in parser.sections() if name.lower() != 'server']
     if unknown_sections:
         raise ConfigError(f'has an unknown section [{unknown_sections[0]}]; only [server] is used')
@@ -2057,7 +2073,13 @@ def read_config(path):
         if key not in CONFIG_KEYS:
             raise ConfigError(f'has an unknown setting "{key}" (valid: {", ".join(CONFIG_KEYS)})')
     settings = {}
-    for key in ('open_browser', 'verbose', 'allow_scripts', 'allow_remote'):
+    for key in (
+        'auto_apply_custom_settings',
+        'open_browser',
+        'verbose',
+        'allow_scripts',
+        'allow_remote',
+    ):
         if key in section:
             try:
                 settings[key] = section.getboolean(key)
@@ -2189,14 +2211,27 @@ def main():
     if args.init_config:
         sys.exit(init_config(Path(args.config) if args.config else user_config_path()))
     settings, config_file = {}, None
-    if not args.no_config:
-        config_file = Path(args.config) if args.config else find_config_file()
-        if config_file is not None:
+    if args.config and not args.no_config:
+        # A file you named yourself is always applied, and a problem with it is an error.
+        config_file = Path(args.config)
+        try:
+            settings = read_config(config_file)
+        except ConfigError as exc:
+            sys.exit(f'error: settings file {config_file} {exc}')
+        print(f'using settings from {config_file}')
+    elif not args.no_config:
+        # A file found automatically is applied only if it is valid AND says to apply itself;
+        # a missing, unreadable or broken one is simply skipped.
+        candidate = find_config_file()
+        if candidate is not None:
             try:
-                settings = read_config(config_file)
+                found = read_config(candidate)
             except ConfigError as exc:
-                sys.exit(f'error: settings file {config_file} {exc}')
-            print(f'using settings from {config_file}')
+                warn(f'ignoring settings file {candidate}: it {exc}')
+            else:
+                if found.get('auto_apply_custom_settings'):
+                    settings, config_file = found, candidate
+                    print(f'using settings from {candidate} (auto-applied)')
     if args.share or args.only_me or args.host is not None:
         chosen_host = '0.0.0.0' if args.share else args.host or '127.0.0.1'  # the command line wins
     elif settings.get('access') == 'share':

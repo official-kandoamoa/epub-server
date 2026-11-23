@@ -1190,11 +1190,16 @@ class ConfigFileTests(TempDirCase):
         self.assertEqual(es.read_config(self.write_config('')), {})
         self.assertEqual(es.read_config(self.write_config('# nothing here\n[server]\n')), {})
 
-    def test_the_generated_template_is_valid_and_sets_nothing(self):
-        self.assertEqual(es.read_config(self.write_config(es.CONFIG_TEMPLATE)), {})
-        # and every setting it documents is a real one
-        for key in es.CONFIG_KEYS:
+    def test_the_generated_template_is_valid_and_only_turns_on_auto_apply(self):
+        found = es.read_config(self.write_config(es.CONFIG_TEMPLATE))
+        self.assertEqual(found, {'auto_apply_custom_settings': True})
+        for key in es.CONFIG_KEYS:  # every setting is documented in it
             self.assertIn(key + ' =', es.CONFIG_TEMPLATE)
+
+    def test_the_auto_apply_setting_has_friendlier_spellings(self):
+        for name in ('auto_apply_custom_settings', 'auto_apply_settings', 'Auto-Apply'):
+            found = es.read_config(self.write_config(f'[server]\n{name} = yes\n'))
+            self.assertEqual(found, {'auto_apply_custom_settings': True}, name)
 
     def test_mistakes_are_explained_not_ignored(self):
         cases = {
@@ -1258,20 +1263,11 @@ class ConfigFileTests(TempDirCase):
         cli, out, err = self.run_with('[server]\nhost = 0.0.0.0\n', '--host', '127.0.0.1')
         self.assertIn(f'serving at http://127.0.0.1:{cli.port}/', out)
 
-    def test_no_config_ignores_even_a_broken_settings_file(self):
-        home = self.tmp / 'home3'
-        (home / 'epub_server').mkdir(parents=True)
-        (home / 'epub_server' / 'config.ini').write_text('[server]\nport = notanumber\n')
-        env = isolated_env(HOME=str(home), XDG_CONFIG_HOME=str(home), APPDATA=str(home))
-        epub = write_epub(self.tmp / 'noc.epub', main_epub_files())
-        broken = run_script(epub, '--port', free_port(), env=env)
-        self.assertNotEqual(broken.returncode, 0)  # the per-user file is picked up and rejected
-        cli = Cli(epub, '--no-config', env=env)
-        try:
-            self.assertEqual(cli.get('/').status, 200)
-        finally:
-            out, err = cli.stop()
-        self.assertNotIn('using settings from', out)
+    def test_no_config_also_silences_the_notice_about_a_broken_auto_file(self):
+        env = self.home_with('noconf', '[server]\nport = notanumber\n')
+        status, out, err = self.serve_with_env(env, '--no-config')
+        self.assertEqual(status, 200)
+        self.assertNotIn('ignoring settings file', err)
 
     def test_broken_config_stops_with_a_clear_message(self):
         config = self.write_config('[server]\nport = notanumber\n')
@@ -1300,39 +1296,136 @@ class ConfigFileTests(TempDirCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn('path', r.stderr)
 
-    def test_config_is_found_in_the_per_user_location_but_never_in_the_current_folder(self):
-        home = self.tmp / 'home'
-        (home / '.config' / 'epub_server').mkdir(parents=True)
-        (home / '.config' / 'epub_server' / 'config.ini').write_text('[server]\nverbose = yes\n')
-        epub = write_epub(self.tmp / 'where.epub', main_epub_files())
-        env = isolated_env(HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'))
-        cli = Cli(epub, env=env)
+    def home_with(self, name, config_text=None):
+        """An isolated environment whose per-user config folder holds `config_text`."""
+        home = self.tmp / name
+        home.mkdir()
+        if config_text is not None:
+            (home / 'epub_server').mkdir()
+            (home / 'epub_server' / 'config.ini').write_text(config_text, encoding='utf-8')
+        return isolated_env(HOME=str(home), XDG_CONFIG_HOME=str(home), APPDATA=str(home))
+
+    def serve_with_env(self, env, *args):
+        epub = write_epub(self.tmp / 'auto.epub', main_epub_files())
+        cli = Cli(epub, *args, env=env)
+        try:
+            status = cli.get('/').status
+        finally:
+            out, err = cli.stop()
+        return status, out, err
+
+    def test_a_valid_file_that_asks_to_auto_apply_is_applied_with_no_arguments_at_all(self):
+        env = self.home_with(
+            'auto1', '[server]\nauto_apply_custom_settings = yes\naccess = share\n'
+        )
+        status, out, err = self.serve_with_env(env)
+        self.assertEqual(status, 200)
+        self.assertIn('(auto-applied)', out)
+        self.assertIn('on your network, open', out)
+
+    def test_a_valid_file_without_auto_apply_is_left_alone(self):
+        for body in (
+            '[server]\naccess = share\n',
+            '[server]\nauto_apply_custom_settings = no\naccess = share\n',
+        ):
+            env = self.home_with('auto2' + str(abs(hash(body))), body)
+            status, out, err = self.serve_with_env(env)
+            self.assertEqual(status, 200)
+            self.assertNotIn('using settings from', out)
+            self.assertNotIn('on your network', out)
+            self.assertNotIn('ignoring settings file', err)  # skipped quietly: nothing is wrong
+
+    def test_a_missing_file_is_skipped(self):
+        status, out, err = self.serve_with_env(self.home_with('auto3'))
+        self.assertEqual(status, 200)
+        self.assertNotIn('using settings from', out)
+        self.assertNotIn('ignoring settings file', err)
+
+    def test_a_corrupted_file_is_skipped_with_a_one_line_notice(self):
+        for body in (
+            '[server]\nauto_apply_custom_settings = yes\nport = notanumber\n',
+            'garbage {{{',
+            '[server\n',
+        ):
+            env = self.home_with('auto4' + str(abs(hash(body))), body)
+            status, out, err = self.serve_with_env(env)
+            self.assertEqual(status, 200, body)  # the server still runs, on built-in defaults
+            self.assertIn('ignoring settings file', err, body)
+            self.assertNotIn('using settings from', out)
+            self.assertNotIn('Traceback', err)
+
+    def test_a_binary_or_unreadable_file_is_skipped_too(self):
+        env = self.home_with('auto5', '[server]\n')
+        (self.tmp / 'auto5' / 'epub_server' / 'config.ini').write_bytes(b'\xff\xfe\x00\x80')
+        status, out, err = self.serve_with_env(env)
+        self.assertEqual(status, 200)
+        self.assertIn('ignoring settings file', err)
+
+    def test_running_with_no_arguments_opens_the_path_from_the_settings(self):
+        epub = write_epub(self.tmp / 'mybook.epub', main_epub_files())
+        env = self.home_with(
+            'auto6', f'[server]\nauto_apply_custom_settings = yes\npath = {epub}\nverbose = yes\n'
+        )
+        cli = Cli(env=env)  # no path, no options
+        try:
+            index = cli.get('/')
+            cli.get('/book/OEBPS/nope.css')
+        finally:
+            out, err = cli.stop()
+        self.assertEqual(index.status, 200)
+        self.assertIn(b'Test Book', index.body)
+        self.assertIn('GET /\n', err)  # verbose came from the file too
+
+    def test_without_a_usable_path_anywhere_the_error_says_how_to_fix_it(self):
+        env = self.home_with('auto7', '[server]\nauto_apply_custom_settings = yes\n')
+        r = run_script(env=env)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('path', r.stderr)
+        self.assertIn('settings file', r.stderr)
+
+    def test_command_line_still_beats_an_auto_applied_file(self):
+        env = self.home_with(
+            'auto8', '[server]\nauto_apply_custom_settings = yes\naccess = share\n'
+        )
+        cli_status, out, err = self.serve_with_env(env, '--only-me')
+        self.assertNotIn('on your network', out)
+
+    def test_no_config_turns_auto_apply_off_for_one_run(self):
+        env = self.home_with(
+            'auto9', '[server]\nauto_apply_custom_settings = yes\naccess = share\n'
+        )
+        status, out, err = self.serve_with_env(env, '--no-config')
+        self.assertNotIn('using settings from', out)
+        self.assertNotIn('on your network', out)
+
+    def test_an_explicit_config_is_applied_even_without_auto_apply_but_errors_are_loud(self):
+        config = self.write_config('[server]\naccess = share\n', 'named.ini')
+        epub = write_epub(self.tmp / 'named.epub', main_epub_files())
+        cli = Cli(epub, '--config', config)
         try:
             cli.get('/')
         finally:
-            out, _ = cli.stop()
-        self.assertIn('using settings from', out)
-        # a settings file lying in the folder you run from is not picked up
+            out, err = cli.stop()
+        self.assertIn('on your network, open', out)
+        self.assertNotIn('(auto-applied)', out)
+
+    def test_a_file_in_the_current_folder_is_never_used(self):
         stray = self.tmp / 'cwd'
         stray.mkdir()
-        (stray / es.CONFIG_FILE_NAME).write_text('[server]\naccess = share\n')
+        (stray / es.CONFIG_FILE_NAME).write_text(
+            '[server]\nauto_apply_custom_settings = yes\naccess = share\n'
+        )
+        epub = write_epub(self.tmp / 'cwdbook.epub', main_epub_files())
         r = subprocess.run(
-            [
-                sys.executable,
-                '-I',
-                str(SCRIPT),
-                str(epub),
-                '--no-browser',
-                '--port',
-                str(free_port()),
-                '--help',
-            ],
+            [sys.executable, '-I', str(SCRIPT), str(epub), '--no-browser', '--help'],
             cwd=stray,
             env=isolated_env(),
             stdout=subprocess.PIPE,
             universal_newlines=True,
         )
-        self.assertNotIn('using settings from', r.stdout)
+        self.assertEqual(r.returncode, 0)
+        status, out, err = self.serve_with_env(self.home_with('auto10'))
+        self.assertNotIn('using settings from', out)
         self.assertEqual(es.user_config_path().name, 'config.ini')
 
     def test_init_config_writes_a_template_once(self):

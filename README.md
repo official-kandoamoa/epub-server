@@ -116,38 +116,41 @@ This starts a local server and opens your browser to it automatically.
 | `--host ADDRESS` | `127.0.0.1` | Advanced: the exact address to listen on, instead of `--only-me`/`--share` |
 | `--no-browser` | off           | Don't automatically open a browser tab                    |
 | `--verbose`    | off           | Log every request (failed requests are always logged)     |
-| `--config FILE` | see below    | Read default settings from this file (see [Settings file](#settings-file-change-the-defaults)) |
+| `--config FILE` | see below    | Read default settings from this file (see [Settings file](#settings-file-run-it-with-no-arguments)) |
 | `--no-config`  | off           | Ignore any settings file this time                        |
 | `--init-config` |              | Write a commented settings file and exit                  |
 | `--allow-scripts` | off        | Let JavaScript inside the book run (blocked by default)   |
 | `--allow-remote`  | off        | Let the book load images/styles/etc. from `https://` sites (blocked by default) |
 
-### Settings file (change the defaults)
+### Settings file (run it with no arguments)
 
-To avoid retyping options, put them in a settings file. Create a commented
-starter file, then edit it:
+Put your usual choices in a settings file and the script uses them by itself:
+`python3 epub_server.py` (or `uv run epub_server.py`) with nothing typed will
+open the book you want, shared the way you want.
 
-```
-python epub_server.py --init-config
-```
+1. Create a commented starter file:
+   ```
+   python3 epub_server.py --init-config
+   ```
+   It is written to `~/.config/epub_server/config.ini` (on Windows,
+   `%APPDATA%\epub_server\config.ini`) and never overwrites an existing file.
+   Use `--init-config --config my.ini` to write it somewhere else.
+2. Edit it. For example:
+   ```ini
+   [server]
+   auto_apply_custom_settings = yes   ; apply this file automatically
+   access = share                     ; or: only-me
+   port = 9000
+   open_browser = no
+   path = ~/Books/my-book.epub        ; served when no path is typed
+   ```
+3. Run `python3 epub_server.py`. It prints `using settings from ... (auto-applied)`.
 
-That writes `~/.config/epub_server/config.ini` (on Windows,
-`%APPDATA%\epub_server\config.ini`) and refuses to overwrite an existing one.
-Use `--init-config --config my.ini` to write it somewhere else.
-
-```ini
-[server]
-access = share          ; or: only-me   (who can open it)
-port = 9000
-open_browser = no
-verbose = no
-allow_scripts = no
-allow_remote = no
-path = ~/Books/my-book.epub   ; served when no path is typed
-```
+Every command-line option has a setting:
 
 | Setting | Values | Same as |
 |---|---|---|
+| `auto_apply_custom_settings` | yes / no (also spelled `auto_apply_settings`) | whether a file found automatically is used at all (see below) |
 | `access` | `only-me` or `share` | `--only-me` / `--share` |
 | `host` | an address, e.g. `127.0.0.1` | `--host` (use `access` *or* `host`, not both) |
 | `port` | 1-65535 | `--port` |
@@ -157,20 +160,32 @@ path = ~/Books/my-book.epub   ; served when no path is typed
 | `allow_remote` | yes / no | `--allow-remote` |
 | `path` | a book, PDF or folder | the `path` argument |
 
-How it is found and applied:
+`--config`, `--no-config`, `--init-config` and `--help` are about the file
+itself, so they have no setting.
 
-- The file used is `--config FILE` if you give one; otherwise `epub_server.ini`
-  next to `epub_server.py`, then the per-user file above. The folder you run
-  from is never searched, so a stray file in a downloaded folder can't change
-  how the server behaves. `--no-config` ignores all of them.
+**Which file, and when it applies**
+
+- **Automatic file.** Without `--config`, the script looks for `epub_server.ini`
+  next to `epub_server.py`, then the per-user file above (the first one that
+  exists). It is applied only if it is valid **and** has
+  `auto_apply_custom_settings = yes`. If it is missing, it is skipped. If it is
+  corrupted (bad value, unknown setting, not text...), it is skipped with a
+  one-line `ignoring settings file ...` notice and the server runs on the
+  built-in defaults. If it is valid but doesn't ask to be applied, it is left
+  alone silently.
+- **A file you name.** `--config FILE` is always applied, whether or not it
+  has `auto_apply_custom_settings`, and a problem in it is an error, since you
+  asked for that file specifically.
+- **Never the current folder.** The folder you run from is not searched, so a
+  stray file in a downloaded folder can't change how the server behaves.
+- `--no-config` ignores every settings file for that run.
 - **Order of priority:** command-line options, then the settings file, then the
   built-in defaults. `--share`, `--only-me` or `--host` on the command line
-  replaces the file's `access`/`host`.
-- Settings are checked strictly: an unknown setting, a bad value, or a missing
-  `[server]` line stops the server with a message saying what to fix, rather
-  than being quietly ignored. Setting names ignore case and `-` vs `_`.
-- A command-line flag can switch things on but not off. If the file says
-  `allow_scripts = yes` for one run you want without it, use `--no-config`.
+  replaces the file's `access`/`host`; a path typed on the command line
+  replaces the file's `path`.
+- Setting names ignore case and `-` vs `_`. A command-line flag can switch
+  things on but not off, so for one run without a file's `allow_scripts = yes`
+  use `--no-config`.
 - Turning on `allow_scripts`, `allow_remote` or `access = share` in the file
   prints the same safety warnings as the matching command-line options.
 - A relative `path` is relative to the settings file's folder; `~` is your home.
