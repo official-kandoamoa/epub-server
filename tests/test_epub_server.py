@@ -1448,6 +1448,42 @@ class CompatibilityTests(TempDirCase):
             self.assertIn(expected, r.stderr, host)
             self.assertNotIn('Traceback', r.stderr, host)
 
+    def test_wildcard_host_prints_usable_links_not_0_0_0_0(self):
+        epub = write_epub(self.tmp / 'lan.epub', main_epub_files())
+        cli = Cli(epub, '--host', '0.0.0.0')
+        try:
+            cli.get('/')
+        finally:
+            out, err = cli.stop()
+        self.assertIn(f'serving at http://localhost:{cli.port}/ on this device', out)
+        self.assertNotIn('http://0.0.0.0', out)
+        self.assertIn('on your network, open', out)
+
+    def test_lan_addresses_skip_loopback_and_link_local_and_repeats(self):
+        class FakeProbe:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def connect(self, addr):
+                pass
+
+            def getsockname(self):
+                return ('192.168.1.23', 5)
+
+        with mock.patch.object(es.socket, 'socket', return_value=FakeProbe()), mock.patch.object(
+            es.socket,
+            'gethostbyname_ex',
+            return_value=('h', [], ['127.0.0.1', '169.254.3.3', '192.168.1.23', '10.0.0.5']),
+        ):
+            self.assertEqual(es.lan_addresses(), ['192.168.1.23', '10.0.0.5'])
+        with mock.patch.object(es.socket, 'socket', side_effect=OSError), mock.patch.object(
+            es.socket, 'gethostbyname_ex', side_effect=OSError
+        ):
+            self.assertEqual(es.lan_addresses(), [])
+
     def test_old_python_gets_a_clear_message(self):
         source = SCRIPT.read_text()
         head = source.split('import argparse')[0]
