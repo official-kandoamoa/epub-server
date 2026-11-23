@@ -45,6 +45,7 @@ if sys.version_info < (3, 7):  # checked before anything newer than 3.6 is impor
     )
 
 import argparse
+import configparser
 import errno
 import hashlib
 import html
@@ -1942,6 +1943,164 @@ def lan_addresses():
     return result
 
 
+# ---------------------------------------------------------------------------
+# Config file: settings that would otherwise be typed on every run
+# ---------------------------------------------------------------------------
+
+CONFIG_FILE_NAME = 'epub_server.ini'
+MAX_CONFIG_BYTES = 64 * 1024
+
+CONFIG_TEMPLATE = """\
+# epub_server settings.  Anything you type on the command line wins over this file,
+# and anything left out here uses the built-in default.
+# Lines starting with # or ; are comments.  Yes/no values: yes, no, true, false, on, off.
+
+[server]
+
+# Who can open it:
+#   only-me  - only this device (the default)
+#   share    - any device on the same Wi-Fi/network (there is no password: trusted networks only)
+# access = only-me
+
+# Advanced alternative to "access": the exact network address to listen on
+# (127.0.0.1 = this device only, 0.0.0.0 = every network connection).
+# Use either "access" or "host", not both.
+# host = 127.0.0.1
+
+# Port number, 1-65535.
+# port = 8000
+
+# Open a browser tab automatically when the server starts.
+# open_browser = yes
+
+# Print every request in the terminal (failed requests are always printed).
+# verbose = no
+
+# Let books run their own JavaScript / load things from https:// sites.
+# Both are off by default for safety; turn on only for books you trust.
+# allow_scripts = no
+# allow_remote = no
+
+# A book, PDF or folder to serve when none is given on the command line.
+# A relative path is relative to this file's folder.  ~ means your home folder.
+# path = ~/Books/my-book.epub
+"""
+CONFIG_KEYS = (
+    'access',
+    'host',
+    'port',
+    'open_browser',
+    'verbose',
+    'allow_scripts',
+    'allow_remote',
+    'path',
+)
+
+
+class ConfigError(ValueError):
+    """The config file can't be used; the message says why, in plain words."""
+
+
+def user_config_path():
+    """Where the per-user config file lives (it need not exist)."""
+    if os.name == 'nt':
+        base = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
+    else:
+        base = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    return base / 'epub_server' / 'config.ini'
+
+
+def find_config_file():
+    """The config file to use when none was named: next to this script, then the per-user one.
+
+    The current folder is deliberately NOT searched, so a folder you merely happen to be
+    standing in (a downloaded book, say) can't change how the server behaves."""
+    for candidate in (Path(__file__).resolve().with_name(CONFIG_FILE_NAME), user_config_path()):
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def read_config(path):
+    """Read and check a config file; returns only the settings it actually sets."""
+    path = Path(path)
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read(MAX_CONFIG_BYTES + 1)
+    except OSError as exc:
+        raise ConfigError(f'cannot be read ({exc.strerror or exc})') from None
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise ConfigError(f'is too big to be a settings file (over {MAX_CONFIG_BYTES // 1024} KB)')
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        raise ConfigError('is not UTF-8 text') from None
+    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=('#',))
+    parser.optionxform = lambda key: key.strip().lower().replace('-', '_')
+    try:
+        parser.read_string(text, source=path.name)
+    except configparser.MissingSectionHeaderError:
+        raise ConfigError('must start with a [server] line before the settings') from None
+    except configparser.Error as exc:
+        raise ConfigError(str(exc).replace('\n', ' ').strip()) from None
+    unknown_sections = [name for name in parser.sections() if name.lower() != 'server']
+    if unknown_sections:
+        raise ConfigError(f'has an unknown section [{unknown_sections[0]}]; only [server] is used')
+    names = [name for name in parser.sections() if name.lower() == 'server']
+    if not names:
+        return {}
+    section = parser[names[0]]
+    for key in section:
+        if key not in CONFIG_KEYS:
+            raise ConfigError(f'has an unknown setting "{key}" (valid: {", ".join(CONFIG_KEYS)})')
+    settings = {}
+    for key in ('open_browser', 'verbose', 'allow_scripts', 'allow_remote'):
+        if key in section:
+            try:
+                settings[key] = section.getboolean(key)
+            except ValueError:
+                raise ConfigError(f'"{key}" must be yes or no, not "{section[key]}"') from None
+    if 'port' in section:
+        try:
+            settings['port'] = port_number(section['port'].strip())
+        except argparse.ArgumentTypeError as exc:
+            raise ConfigError(f'"port": {exc}') from None
+    if 'access' in section:
+        access = section['access'].strip().lower().replace('_', '-')
+        if access not in ('only-me', 'share'):
+            raise ConfigError(f'"access" must be only-me or share, not "{section["access"]}"')
+        settings['access'] = access
+    if 'host' in section:
+        settings['host'] = section['host'].strip()
+        if not settings['host']:
+            raise ConfigError('"host" is empty')
+    if 'access' in settings and 'host' in settings:
+        raise ConfigError('sets both "access" and "host"; use one of them')
+    if 'path' in section:
+        value = section['path'].strip()
+        if not value:
+            raise ConfigError('"path" is empty')
+        settings['path'] = str((path.resolve().parent / Path(value).expanduser()))
+    return settings
+
+
+def init_config(target):
+    """Write the commented template to `target`. Returns 0, or an error message to exit with."""
+    if target.exists():
+        return f'error: {target} already exists; edit it, or remove it first to start over'
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, 'x', encoding='utf-8') as f:
+            f.write(CONFIG_TEMPLATE)
+    except OSError as exc:
+        return f'error: could not write {target}: {exc.strerror or exc}'
+    print(f'wrote {target}\nEdit it to change the defaults; command-line options still win.')
+    return 0
+
+
 def port_number(text):
     """argparse type: a TCP port, 1-65535."""
     try:
@@ -1960,7 +2119,9 @@ def main():
     parser.add_argument(
         'epub',
         metavar='path',
-        help='.epub or .pdf file, or a folder: either extracted epub contents or PDFs to host',
+        nargs='?',
+        help='.epub or .pdf file, or a folder: either extracted epub contents or PDFs to host '
+        '(may be left out if a config file sets "path")',
     )
     who = parser.add_mutually_exclusive_group()
     who.add_argument(
@@ -1976,7 +2137,7 @@ def main():
     parser.add_argument(
         '--port',
         type=port_number,
-        default=8000,
+        default=None,
         help='port number to serve on, 1-65535 (default 8000)',
     )
     parser.add_argument(
@@ -2005,10 +2166,53 @@ def main():
         help='let EPUBs load images, fonts and styles from https:// sites '
         '(blocked by default, so a book cannot phone home while you read it)',
     )
+    configuration = parser.add_argument_group('settings file')
+    configuration.add_argument(
+        '--config',
+        metavar='FILE',
+        help=f'read default settings from this file (otherwise {CONFIG_FILE_NAME} next to this '
+        'script, then the per-user config file, is used if it exists)',
+    )
+    configuration.add_argument(
+        '--no-config', action='store_true', help='ignore any settings file this time'
+    )
+    configuration.add_argument(
+        '--init-config',
+        action='store_true',
+        help='write a commented settings file (to --config FILE, or the per-user location) and exit',
+    )
     args = parser.parse_args()
     if args.host is not None and (args.share or args.only_me):
         parser.error('--host cannot be combined with --share or --only-me (pick one way to choose)')
-    args.host = '0.0.0.0' if args.share else args.host or '127.0.0.1'
+    if args.config and args.no_config:
+        parser.error('--config cannot be combined with --no-config')
+    if args.init_config:
+        sys.exit(init_config(Path(args.config) if args.config else user_config_path()))
+    settings, config_file = {}, None
+    if not args.no_config:
+        config_file = Path(args.config) if args.config else find_config_file()
+        if config_file is not None:
+            try:
+                settings = read_config(config_file)
+            except ConfigError as exc:
+                sys.exit(f'error: settings file {config_file} {exc}')
+            print(f'using settings from {config_file}')
+    if args.share or args.only_me or args.host is not None:
+        chosen_host = '0.0.0.0' if args.share else args.host or '127.0.0.1'  # the command line wins
+    elif settings.get('access') == 'share':
+        chosen_host = '0.0.0.0'
+    else:
+        chosen_host = settings.get('host') or '127.0.0.1'
+    args.host = chosen_host
+    args.port = args.port if args.port is not None else settings.get('port', 8000)
+    args.no_browser = args.no_browser or not settings.get('open_browser', True)
+    for flag in ('verbose', 'allow_scripts', 'allow_remote'):
+        setattr(args, flag, getattr(args, flag) or settings.get(flag, False))
+    args.epub = args.epub or settings.get('path')
+    if not args.epub:
+        parser.error(
+            'the following arguments are required: path (or set "path" in a settings file)'
+        )
     for stream in (sys.stdout, sys.stderr):
         # A Windows console in a legacy code page would crash on a title with, say, CJK
         # characters; show a replacement mark instead.

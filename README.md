@@ -116,8 +116,64 @@ This starts a local server and opens your browser to it automatically.
 | `--host ADDRESS` | `127.0.0.1` | Advanced: the exact address to listen on, instead of `--only-me`/`--share` |
 | `--no-browser` | off           | Don't automatically open a browser tab                    |
 | `--verbose`    | off           | Log every request (failed requests are always logged)     |
+| `--config FILE` | see below    | Read default settings from this file (see [Settings file](#settings-file-change-the-defaults)) |
+| `--no-config`  | off           | Ignore any settings file this time                        |
+| `--init-config` |              | Write a commented settings file and exit                  |
 | `--allow-scripts` | off        | Let JavaScript inside the book run (blocked by default)   |
 | `--allow-remote`  | off        | Let the book load images/styles/etc. from `https://` sites (blocked by default) |
+
+### Settings file (change the defaults)
+
+To avoid retyping options, put them in a settings file. Create a commented
+starter file, then edit it:
+
+```
+python epub_server.py --init-config
+```
+
+That writes `~/.config/epub_server/config.ini` (on Windows,
+`%APPDATA%\epub_server\config.ini`) and refuses to overwrite an existing one.
+Use `--init-config --config my.ini` to write it somewhere else.
+
+```ini
+[server]
+access = share          ; or: only-me   (who can open it)
+port = 9000
+open_browser = no
+verbose = no
+allow_scripts = no
+allow_remote = no
+path = ~/Books/my-book.epub   ; served when no path is typed
+```
+
+| Setting | Values | Same as |
+|---|---|---|
+| `access` | `only-me` or `share` | `--only-me` / `--share` |
+| `host` | an address, e.g. `127.0.0.1` | `--host` (use `access` *or* `host`, not both) |
+| `port` | 1-65535 | `--port` |
+| `open_browser` | yes / no | `--no-browser` when `no` |
+| `verbose` | yes / no | `--verbose` |
+| `allow_scripts` | yes / no | `--allow-scripts` |
+| `allow_remote` | yes / no | `--allow-remote` |
+| `path` | a book, PDF or folder | the `path` argument |
+
+How it is found and applied:
+
+- The file used is `--config FILE` if you give one; otherwise `epub_server.ini`
+  next to `epub_server.py`, then the per-user file above. The folder you run
+  from is never searched, so a stray file in a downloaded folder can't change
+  how the server behaves. `--no-config` ignores all of them.
+- **Order of priority:** command-line options, then the settings file, then the
+  built-in defaults. `--share`, `--only-me` or `--host` on the command line
+  replaces the file's `access`/`host`.
+- Settings are checked strictly: an unknown setting, a bad value, or a missing
+  `[server]` line stops the server with a message saying what to fix, rather
+  than being quietly ignored. Setting names ignore case and `-` vs `_`.
+- A command-line flag can switch things on but not off. If the file says
+  `allow_scripts = yes` for one run you want without it, use `--no-config`.
+- Turning on `allow_scripts`, `allow_remote` or `access = share` in the file
+  prints the same safety warnings as the matching command-line options.
+- A relative `path` is relative to the settings file's folder; `~` is your home.
 
 ### Examples
 

@@ -79,10 +79,24 @@ def free_port():
         return s.getsockname()[1]
 
 
+_EMPTY_HOME = tempfile.mkdtemp(prefix='epub_server_home_')
+
+
+def isolated_env(**extra):
+    """An environment whose home/config folders are empty, so a real settings file on the
+    machine running the tests can't change the results."""
+    env = dict(os.environ)
+    env.update(
+        HOME=_EMPTY_HOME, XDG_CONFIG_HOME=_EMPTY_HOME, APPDATA=_EMPTY_HOME, USERPROFILE=_EMPTY_HOME
+    )
+    env.update(extra)
+    return env
+
+
 class Cli:
     """The script run as a real subprocess, the way a user would run it."""
 
-    def __init__(self, *args):
+    def __init__(self, *args, env=None):
         self.port = free_port()
         self.proc = subprocess.Popen(
             [
@@ -98,6 +112,7 @@ class Cli:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
+            env=env or isolated_env(),
         )
         for _ in range(100):
             try:
@@ -118,7 +133,7 @@ class Cli:
             return self.proc.communicate()
 
 
-def run_script(*args):
+def run_script(*args, env=None):
     """Run the script expecting it to exit on its own (bad input); returns the process."""
     return subprocess.run(
         [sys.executable, '-I', str(SCRIPT), *map(str, args), '--no-browser'],
@@ -126,6 +141,7 @@ def run_script(*args):
         stderr=subprocess.PIPE,
         universal_newlines=True,
         timeout=30,
+        env=env or isolated_env(),
     )
 
 
@@ -1137,6 +1153,211 @@ class PdfTests(TempDirCase):
 # ---------------------------------------------------------------------------
 # the real command line
 # ---------------------------------------------------------------------------
+
+
+class ConfigFileTests(TempDirCase):
+    def write_config(self, text, name='settings.ini'):
+        path = self.tmp / name
+        path.write_text(text, encoding='utf-8')
+        return path
+
+    def test_every_setting_is_read_and_checked(self):
+        path = self.write_config(
+            '[server]\naccess = share\nport = 9100\nopen_browser = no\nverbose = yes\n'
+            'allow_scripts = on\nallow_remote = false\npath = books/a.epub\n'
+        )
+        found = es.read_config(path)
+        self.assertEqual(
+            found,
+            {
+                'access': 'share',
+                'port': 9100,
+                'open_browser': False,
+                'verbose': True,
+                'allow_scripts': True,
+                'allow_remote': False,
+                'path': str(self.tmp.resolve() / 'books' / 'a.epub'),
+            },
+        )
+
+    def test_keys_are_forgiving_about_case_and_dashes(self):
+        found = es.read_config(
+            self.write_config('[Server]\nAllow-Scripts = YES\naccess = Only_Me\n')
+        )
+        self.assertEqual(found, {'allow_scripts': True, 'access': 'only-me'})
+
+    def test_empty_file_or_only_comments_change_nothing(self):
+        self.assertEqual(es.read_config(self.write_config('')), {})
+        self.assertEqual(es.read_config(self.write_config('# nothing here\n[server]\n')), {})
+
+    def test_the_generated_template_is_valid_and_sets_nothing(self):
+        self.assertEqual(es.read_config(self.write_config(es.CONFIG_TEMPLATE)), {})
+        # and every setting it documents is a real one
+        for key in es.CONFIG_KEYS:
+            self.assertIn(key + ' =', es.CONFIG_TEMPLATE)
+
+    def test_mistakes_are_explained_not_ignored(self):
+        cases = {
+            'port = 70000': '"port"',
+            'port = abc': '"port"',
+            'verbose = maybe': 'must be yes or no',
+            'access = everyone': 'must be only-me or share',
+            'hots = 1': 'unknown setting "hots"',
+            'access = share\nhost = 0.0.0.0': 'both "access" and "host"',
+            'host =': '"host" is empty',
+            'path =': '"path" is empty',
+            'port = 1\nport = 2': 'port',
+        }
+        for body, expected in cases.items():
+            path = self.write_config('[server]\n' + body + '\n')
+            with self.assertRaisesRegex(es.ConfigError, expected, msg=body):
+                es.read_config(path)
+        for text, expected in (
+            ('port = 1\n', 'must start with a \\[server\\] line'),
+            ('[other]\nport = 1\n', 'unknown section'),
+            ('[server\n', ''),
+        ):
+            with self.assertRaisesRegex(es.ConfigError, expected, msg=text):
+                es.read_config(self.write_config(text))
+
+    def test_unreadable_binary_or_huge_files_are_rejected(self):
+        (self.tmp / 'bin.ini').write_bytes(b'\xff\xfe\x00\x01\x80')
+        with self.assertRaisesRegex(es.ConfigError, 'not UTF-8'):
+            es.read_config(self.tmp / 'bin.ini')
+        (self.tmp / 'big.ini').write_bytes(b'#' * (es.MAX_CONFIG_BYTES + 10))
+        with self.assertRaisesRegex(es.ConfigError, 'too big'):
+            es.read_config(self.tmp / 'big.ini')
+        with self.assertRaisesRegex(es.ConfigError, 'cannot be read'):
+            es.read_config(self.tmp / 'missing.ini')
+
+    def run_with(self, config_text, *args):
+        config = self.write_config(config_text)
+        epub = write_epub(self.tmp / 'cfg.epub', main_epub_files())
+        cli = Cli(epub, '--config', config, *args)
+        try:
+            cli.get('/')
+        finally:
+            out, err = cli.stop()
+        return cli, out, err
+
+    def test_config_values_become_the_defaults(self):
+        _, out, err = self.run_with('[server]\naccess = share\n')
+        self.assertIn('using settings from', out)
+        self.assertIn('on your network, open', out)
+        self.assertIn('anyone who can reach this machine', err)
+
+    def test_config_can_enable_the_scripts_and_remote_switches_with_the_usual_warnings(self):
+        _, _, err = self.run_with('[server]\nallow_scripts = yes\nallow_remote = yes\n')
+        self.assertIn('scripts inside the book are allowed', err)
+        self.assertIn('https:// sites', err)
+
+    def test_command_line_beats_the_config_file(self):
+        cli, out, err = self.run_with('[server]\naccess = share\n', '--only-me')
+        self.assertNotIn('on your network', out)
+        self.assertIn(f'serving at http://127.0.0.1:{cli.port}/', out)
+        cli, out, err = self.run_with('[server]\nhost = 0.0.0.0\n', '--host', '127.0.0.1')
+        self.assertIn(f'serving at http://127.0.0.1:{cli.port}/', out)
+
+    def test_no_config_ignores_even_a_broken_settings_file(self):
+        home = self.tmp / 'home3'
+        (home / 'epub_server').mkdir(parents=True)
+        (home / 'epub_server' / 'config.ini').write_text('[server]\nport = notanumber\n')
+        env = isolated_env(HOME=str(home), XDG_CONFIG_HOME=str(home), APPDATA=str(home))
+        epub = write_epub(self.tmp / 'noc.epub', main_epub_files())
+        broken = run_script(epub, '--port', free_port(), env=env)
+        self.assertNotEqual(broken.returncode, 0)  # the per-user file is picked up and rejected
+        cli = Cli(epub, '--no-config', env=env)
+        try:
+            self.assertEqual(cli.get('/').status, 200)
+        finally:
+            out, err = cli.stop()
+        self.assertNotIn('using settings from', out)
+
+    def test_broken_config_stops_with_a_clear_message(self):
+        config = self.write_config('[server]\nport = notanumber\n')
+        epub = write_epub(self.tmp / 'broken.epub', main_epub_files())
+        r = run_script(epub, '--config', config)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(f'error: settings file {config}', r.stderr)
+        self.assertIn('"port"', r.stderr)
+        self.assertNotIn('Traceback', r.stderr)
+
+    def test_named_config_file_must_exist(self):
+        epub = write_epub(self.tmp / 'nofile.epub', main_epub_files())
+        r = run_script(epub, '--config', self.tmp / 'nope.ini')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('cannot be read', r.stderr)
+
+    def test_path_can_come_from_the_config_and_is_required_from_somewhere(self):
+        epub = write_epub(self.tmp / 'frompath.epub', main_epub_files())
+        config = self.write_config(f'[server]\npath = {epub.name}\n')
+        cli = Cli('--config', config)
+        try:
+            self.assertEqual(cli.get('/').status, 200)
+        finally:
+            cli.stop()
+        r = run_script('--config', self.write_config('[server]\n', 'empty.ini'))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('path', r.stderr)
+
+    def test_config_is_found_in_the_per_user_location_but_never_in_the_current_folder(self):
+        home = self.tmp / 'home'
+        (home / '.config' / 'epub_server').mkdir(parents=True)
+        (home / '.config' / 'epub_server' / 'config.ini').write_text('[server]\nverbose = yes\n')
+        epub = write_epub(self.tmp / 'where.epub', main_epub_files())
+        env = isolated_env(HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'))
+        cli = Cli(epub, env=env)
+        try:
+            cli.get('/')
+        finally:
+            out, _ = cli.stop()
+        self.assertIn('using settings from', out)
+        # a settings file lying in the folder you run from is not picked up
+        stray = self.tmp / 'cwd'
+        stray.mkdir()
+        (stray / es.CONFIG_FILE_NAME).write_text('[server]\naccess = share\n')
+        r = subprocess.run(
+            [
+                sys.executable,
+                '-I',
+                str(SCRIPT),
+                str(epub),
+                '--no-browser',
+                '--port',
+                str(free_port()),
+                '--help',
+            ],
+            cwd=stray,
+            env=isolated_env(),
+            stdout=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        self.assertNotIn('using settings from', r.stdout)
+        self.assertEqual(es.user_config_path().name, 'config.ini')
+
+    def test_init_config_writes_a_template_once(self):
+        target = self.tmp / 'new' / 'dir' / 'conf.ini'
+        r = run_script('--init-config', '--config', target)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('wrote', r.stdout)
+        self.assertEqual(target.read_text(encoding='utf-8'), es.CONFIG_TEMPLATE)
+        again = run_script('--init-config', '--config', target)
+        self.assertNotEqual(again.returncode, 0)
+        self.assertIn('already exists', again.stderr)
+        self.assertEqual(target.read_text(encoding='utf-8'), es.CONFIG_TEMPLATE)
+
+    def test_init_config_defaults_to_the_per_user_location(self):
+        home = self.tmp / 'home2'
+        env = isolated_env(
+            HOME=str(home), XDG_CONFIG_HOME=str(home / 'cfg'), APPDATA=str(home / 'cfg')
+        )
+        r = run_script('--init-config', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((home / 'cfg' / 'epub_server' / 'config.ini').is_file())
+
+    def test_config_and_no_config_conflict(self):
+        r = run_script('--config', 'x.ini', '--no-config', 'a.epub')
+        self.assertEqual(r.returncode, 2)
 
 
 class BrowserCompatibilityTests(TempDirCase):
