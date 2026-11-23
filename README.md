@@ -110,8 +110,10 @@ This starts a local server and opens your browser to it automatically.
 | Option         | Default       | Description                                              |
 |----------------|---------------|-----------------------------------------------------------|
 | `path`         | *(required)*  | An `.epub` or `.pdf` file, or a folder: either already-extracted epub contents or a folder of PDFs to host |
-| `--port PORT`  | `8000`        | Port to serve on                                          |
-| `--host HOST`  | `127.0.0.1`   | Host/interface to bind to                                  |
+| `--only-me`    | *(default)*   | Only this device can open it                              |
+| `--share`      | off           | Any device on the same Wi-Fi/network can open it (no password: trusted networks only) |
+| `--port PORT`  | `8000`        | Port to serve on (1-65535)                                |
+| `--host ADDRESS` | `127.0.0.1` | Advanced: the exact address to listen on, instead of `--only-me`/`--share` |
 | `--no-browser` | off           | Don't automatically open a browser tab                    |
 | `--verbose`    | off           | Log every request (failed requests are always logged)     |
 | `--allow-scripts` | off        | Let JavaScript inside the book run (blocked by default)   |
@@ -143,10 +145,10 @@ python epub_server.py ./my-extracted-book/
 Allow other devices on your network to connect (e.g. read on your phone
 while it runs on your laptop) — only do this on networks you trust:
 ```
-python epub_server.py my-book.epub --host 0.0.0.0
+python epub_server.py my-book.epub --share
 ```
 
-When you use `--host 0.0.0.0`, the terminal prints the links to use:
+When you use `--share` (or `--host 0.0.0.0`), the terminal prints the links to use:
 `serving at http://localhost:8000/ on this device` and one
 `on your network, open http://192.168.x.x:8000/` line per local address
 (`0.0.0.0` itself is not an address you can visit). In Termux, open those
@@ -170,7 +172,7 @@ python epub_server.py ./my-pdfs/
 Share a PDF library with other devices on your network (only on networks you
 trust — anyone who can reach the port can read every PDF in the folder):
 ```
-python epub_server.py ./my-pdfs/ --host 0.0.0.0 --no-browser
+python epub_server.py ./my-pdfs/ --share --no-browser
 ```
 
 How the path is interpreted:

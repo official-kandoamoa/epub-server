@@ -1448,6 +1448,37 @@ class CompatibilityTests(TempDirCase):
             self.assertIn(expected, r.stderr, host)
             self.assertNotIn('Traceback', r.stderr, host)
 
+    def test_share_means_any_device_and_only_me_means_this_device(self):
+        epub = write_epub(self.tmp / 'who.epub', main_epub_files())
+        cli = Cli(epub, '--share')
+        try:
+            cli.get('/')
+        finally:
+            out, err = cli.stop()
+        self.assertIn('on your network, open', out)
+        self.assertIn('anyone who can reach this machine', err)
+        for flags in ((), ('--only-me',)):
+            cli = Cli(epub, *flags)
+            try:
+                cli.get('/')
+            finally:
+                out, err = cli.stop()
+            self.assertIn(f'serving at http://127.0.0.1:{cli.port}/', out, flags)
+            self.assertNotIn('on your network', out, flags)
+            self.assertNotIn('anyone who can reach', err, flags)
+
+    def test_share_only_me_and_host_cannot_be_combined(self):
+        epub = write_epub(self.tmp / 'combo.epub', main_epub_files())
+        for flags in (
+            ('--share', '--only-me'),
+            ('--share', '--host', '127.0.0.1'),
+            ('--only-me', '--host', '0.0.0.0'),
+        ):
+            r = run_script(str(epub), *flags)
+            self.assertEqual(r.returncode, 2, flags)
+            self.assertNotIn('Traceback', r.stderr)
+            self.assertRegex(r.stderr, 'not allowed with|cannot be combined')
+
     def test_wildcard_host_prints_usable_links_not_0_0_0_0(self):
         epub = write_epub(self.tmp / 'lan.epub', main_epub_files())
         cli = Cli(epub, '--host', '0.0.0.0')

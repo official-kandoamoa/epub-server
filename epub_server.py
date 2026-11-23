@@ -1962,8 +1962,30 @@ def main():
         metavar='path',
         help='.epub or .pdf file, or a folder: either extracted epub contents or PDFs to host',
     )
-    parser.add_argument('--port', type=port_number, default=8000)
-    parser.add_argument('--host', default='127.0.0.1')
+    who = parser.add_mutually_exclusive_group()
+    who.add_argument(
+        '--only-me',
+        action='store_true',
+        help='only this device can open it (this is the default)',
+    )
+    who.add_argument(
+        '--share',
+        action='store_true',
+        help='any device on the same Wi-Fi/network can open it (no password: use trusted networks)',
+    )
+    parser.add_argument(
+        '--port',
+        type=port_number,
+        default=8000,
+        help='port number to serve on, 1-65535 (default 8000)',
+    )
+    parser.add_argument(
+        '--host',
+        default=None,
+        metavar='ADDRESS',
+        help='advanced: the exact network address to listen on, instead of --only-me/--share '
+        '(127.0.0.1 = this device only, 0.0.0.0 = every network connection)',
+    )
     parser.add_argument(
         '--no-browser', action='store_true', help="don't try to auto-open a browser tab"
     )
@@ -1984,6 +2006,9 @@ def main():
         '(blocked by default, so a book cannot phone home while you read it)',
     )
     args = parser.parse_args()
+    if args.host is not None and (args.share or args.only_me):
+        parser.error('--host cannot be combined with --share or --only-me (pick one way to choose)')
+    args.host = '0.0.0.0' if args.share else args.host or '127.0.0.1'
     for stream in (sys.stdout, sys.stderr):
         # A Windows console in a legacy code page would crash on a title with, say, CJK
         # characters; show a replacement mark instead.
