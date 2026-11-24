@@ -1516,10 +1516,29 @@ class ConfigFileTests(TempDirCase):
         self.assertNotIn('<script', page)
         self.assertNotIn('PDF.js fallback is on', out)
 
+    def test_pdfjs_mode_and_version_on_the_command_line(self):
+        page, out = self.pdf_cli('--pdfjs', 'legacy')
+        self.assertIn('data-pdfjs-mode="legacy"', page)
+        self.assertIn('3.11.174 only', out)
+        page, out = self.pdf_cli('--pdfjs', 'latest', '--pdfjs-latest-version', '6.0.1')
+        self.assertIn('data-pdfjs-mode="latest"', page)
+        self.assertIn('data-pdfjs-latest="6.0.1"', page)
+        page, out = self.pdf_cli('--pdfjs', 'off')
+        self.assertNotIn('cdnjs', page)
+        for bad in (('--pdfjs-latest-version', '1/../x'), ('--pdfjs', 'bogus')):
+            self.assertEqual(run_script(*bad, self.tmp).returncode, 2)
+
     def test_pdfjs_setting_in_the_config_file(self):
         self.assertEqual(
-            es.read_config(self.write_config('[server]\npdfjs = no\n')), {'pdfjs': False}
+            es.read_config(self.write_config('[server]\npdfjs = no\n')), {'pdfjs': 'off'}
         )
+        for text, mode in (('yes', 'auto'), ('Legacy', 'legacy'), ('latest', 'latest')):
+            config = self.write_config(f'[server]\npdfjs = {text}\n', 'm.ini')
+            self.assertEqual(es.read_config(config), {'pdfjs': mode})
+        config = self.write_config('[server]\npdfjs_latest_version = 6.6.1\n', 'v.ini')
+        self.assertEqual(es.read_config(config), {'pdfjs_latest_version': '6.6.1'})
+        with self.assertRaisesRegex(es.ConfigError, 'pdfjs_latest_version'):
+            es.read_config(self.write_config('[server]\npdfjs_latest_version = 1/../x\n', 'w.ini'))
         with self.assertRaisesRegex(es.ConfigError, 'pdfjs'):
             es.read_config(self.write_config('[server]\npdfjs = sometimes\n', 'bad.ini'))
         config = self.write_config('[server]\npdfjs = no\n', 'off.ini')
@@ -1718,14 +1737,16 @@ class BrowserCompatibilityTests(TempDirCase):
         for part in ('id="btn-pdfjs"', 'id="pdfjs-wrap"', 'id="pdfjs-scroll"', '<object data='):
             self.assertIn(part, page)
         # the only other site it can contact, at a fixed version
-        self.assertIn('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174', page)
+        self.assertIn('data-pdfjs-legacy="3.11.174"', page)
+        self.assertIn(f'data-pdfjs-latest="{es.PDFJS_LATEST_VERSION}"', page)
+        self.assertIn('data-pdfjs-mode="auto"', page)
         self.assertEqual(
             set(re.findall(r'https://[a-z0-9.-]+', page)), {'https://cdnjs.cloudflare.com'}
         )
         # CVE-2024-4367: a crafted PDF must not be able to run script in this page
         self.assertIn('isEvalSupported: false', page)
         self.assertIn('withCredentials: false', page)
-        self.assertEqual(es.PDFJS_VERSION, '3.11.174')
+        self.assertEqual(es.PDFJS_LEGACY_VERSION, '3.11.174')
 
     def test_turning_pdfjs_off_removes_every_trace_of_it(self):
         root = self.tmp / 'nopdfjs'

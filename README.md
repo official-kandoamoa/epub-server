@@ -89,10 +89,13 @@ single `.pdf`, or a whole folder of them.
   switches by itself to [PDF.js](https://mozilla.github.io/pdf.js/) (page
   by page, with Prev/Next, arrow keys and zoom); a "PDF.js viewer" button lets
   you switch by hand anywhere. PDF.js is loaded from `cdnjs.cloudflare.com`
-  (version 3.11.174, pinned) **only** in that case, so the device needs
-  internet access; the PDF itself is still read from this server. It runs with
+  **only** in that case, so the device needs internet access. By default
+  (`--pdfjs auto`) it tries the newest release (6.5.438) and, if that fails to
+  load or open the file on this device, automatically falls back to the old
+  3.11.174 (the last release that runs as a plain script on old TV browsers),
+  and remembers the failure in the browser so it doesn't retry every time; the PDF itself is still read from this server. It runs with
   `isEvalSupported: false`, Mozilla's mitigation for CVE-2024-4367 (a crafted
-  PDF running script in the page). Use `--no-pdfjs` (or `pdfjs = no` in the
+  PDF running script in the page). Use `--pdfjs off` (or `--no-pdfjs`, or `pdfjs = no` in the
   settings file) to never load anything from another site.
 - **Browser heads-up** — if your browser looks too old (older than Chrome/Edge
   84, Firefox 78, Safari/iOS 14, Opera 70, Samsung Internet 14; any Internet
@@ -129,7 +132,9 @@ This starts a local server and opens your browser to it automatically.
 | `--host ADDRESS` | `127.0.0.1` | Advanced: the exact address to listen on, instead of `--only-me`/`--share` |
 | `--no-browser` | off           | Don't automatically open a browser tab                    |
 | `--verbose`    | off           | Log every request (failed requests are always logged)     |
-| `--no-pdfjs`   | off           | Never use the PDF.js fallback viewer (nothing is loaded from other sites) |
+| `--pdfjs MODE` | auto          | PDF.js fallback: `auto` (newest, old 3.11.174 as backup), `latest` (newest only), `legacy` (old only), `off` |
+| `--no-pdfjs`   | off           | Same as `--pdfjs off` (nothing is loaded from other sites) |
+| `--pdfjs-latest-version X.Y.Z` | 6.5.438 | Which release "latest" means |
 | `--config FILE` | see below    | Read default settings from this file (see [Settings file](#settings-file-run-it-with-no-arguments)) |
 | `--no-config`  | off           | Ignore any settings file this time                        |
 | `--init-config` |              | Write a commented settings file and exit                  |
@@ -172,7 +177,8 @@ Every command-line option has a setting:
 | `verbose` | yes / no | `--verbose` |
 | `allow_scripts` | yes / no | `--allow-scripts` |
 | `allow_remote` | yes / no | `--allow-remote` |
-| `pdfjs` | yes / no | `--no-pdfjs` when `no` |
+| `pdfjs` | auto / latest / legacy / off (yes = auto, no = off) | `--pdfjs` |
+| `pdfjs_latest_version` | a version like 6.5.438 | `--pdfjs-latest-version` |
 | `path` | a book, PDF or folder | the `path` argument |
 
 `--config`, `--no-config`, `--init-config` and `--help` are about the file
@@ -286,8 +292,8 @@ page **automatically switches to the PDF.js viewer**. You can also click
 renders the file client-side; the PDF itself is still fetched from this
 server (same origin), so it works even when the browser's native viewer and
 "Save as…" are disabled. It needs a network connection only for the PDF.js
-library; after that the document is local. Start with `--no-pdfjs` (or set
-`pdfjs = no`) to turn the fallback off so nothing is loaded from other sites. You
+library; after that the document is local. Start with `--pdfjs off` (or set
+`pdfjs = off`) to turn the fallback off so nothing is loaded from other sites. You
 can switch back to the native viewer with the button that appears. "Open in new tab" and "Download" remain
 available when the environment allows them.
 

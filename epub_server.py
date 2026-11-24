@@ -1341,6 +1341,12 @@ def printable(text, limit=200):
     return shown + ('...' if len(text) > limit else '')
 
 
+PDFJS_LATEST_VERSION = '6.5.438'
+PDFJS_LEGACY_VERSION = '3.11.174'
+PDFJS_MODES = ('auto', 'latest', 'legacy', 'off')
+_PDFJS_VERSION_RE = re.compile(r'\d{1,3}\.\d{1,3}\.\d{1,4}')
+
+
 class ReaderHandler(BaseHTTPRequestHandler):
     book = None
     verbose = False
@@ -1348,6 +1354,8 @@ class ReaderHandler(BaseHTTPRequestHandler):
     chapter_cache = None  # ByteLRU of processed chapters, if set
     for_pdf = False  # whether entry pages host PDFs (changes the browser heads-up)
     pdfjs = True  # whether the PDF viewer may fall back to PDF.js (loaded from a CDN)
+    pdfjs_mode = 'auto'  # auto / latest / legacy (which PDF.js version(s) to try)
+    pdfjs_latest = PDFJS_LATEST_VERSION
     allowed_hosts = None  # accepted Host header names (DNS-rebinding defence), if set
     timeout = 60  # seconds a client may stall on the socket before its connection is dropped
     security_headers = {
@@ -1648,22 +1656,29 @@ PDFJS_CSS = (
     '#pdfjs-status.error{color:#f88}'
 )
 
-# Pinned Mozilla PDF.js (CDN). Used only as a fallback when the browser has no
-# native PDF plugin. Same-origin fetch of the PDF still works even when the
-# browser's "Download" UI is disabled.
-# 3.11.x still ships a classic UMD build that sets window.pdfjsLib (4+ is
-# ESM-first and harder to load from a plain <script> in restricted engines).
-PDFJS_VERSION = '3.11.174'
-PDFJS_CDN = f'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/{PDFJS_VERSION}'
+# Mozilla PDF.js, loaded from a CDN, only when the browser has no PDF viewer of its own (or
+# the "PDF.js viewer" button is pressed). The PDF itself is still fetched from this server.
+# Two pinned versions: the newest, which is the one that gets security fixes, and an old
+# classic-script release (3.11.x) that still runs on very old engines such as smart TVs and
+# so serves as the backup if the newest does not load, open or draw the file.
 
 PDFJS_VIEWER_SCRIPT = r'''
 (function () {
-  var pdfUrl = document.body.getAttribute('data-pdf-url');
+  var body = document.body;
+  var pdfUrl = body.getAttribute('data-pdf-url');
+  var mode = body.getAttribute('data-pdfjs-mode') || 'auto';
+  var versions = {
+    latest: body.getAttribute('data-pdfjs-latest'),
+    legacy: body.getAttribute('data-pdfjs-legacy')
+  };
+  var CDN = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/';
+  var SKIP_KEY = 'epub_server_pdfjs_skip_latest';
   var nativeWrap = document.getElementById('native-wrap');
   var pdfjsWrap = document.getElementById('pdfjs-wrap');
   var statusEl = document.getElementById('pdfjs-status');
   var scrollEl = document.getElementById('pdfjs-scroll');
   var pageLabel = document.getElementById('pdfjs-page');
+  var verLabel = document.getElementById('pdfjs-ver');
   var btnPrev = document.getElementById('pdfjs-prev');
   var btnNext = document.getElementById('pdfjs-next');
   var btnZoomIn = document.getElementById('pdfjs-zoomin');
@@ -1671,6 +1686,7 @@ PDFJS_VIEWER_SCRIPT = r'''
   var btnNative = document.getElementById('btn-native');
   var btnPdfjs = document.getElementById('btn-pdfjs');
   var pdfDoc = null;
+  var started = false;
   var pageNum = 1;
   var scale = 1.1;
   var rendering = false;
@@ -1682,6 +1698,10 @@ PDFJS_VIEWER_SCRIPT = r'''
     statusEl.style.display = msg ? 'block' : 'none';
   }
 
+  function message(err) {
+    return err && err.message ? err.message : String(err);
+  }
+
   function updateControls() {
     if (!pdfDoc) return;
     pageLabel.textContent = pageNum + ' / ' + pdfDoc.numPages;
@@ -1689,89 +1709,162 @@ PDFJS_VIEWER_SCRIPT = r'''
     btnNext.disabled = pageNum >= pdfDoc.numPages;
   }
 
-  function renderPage(num) {
-    rendering = true;
-    pdfDoc.getPage(num).then(function (page) {
-      var viewport = page.getViewport({ scale: scale });
-      var canvas = document.createElement('canvas');
-      var ctx = canvas.getContext('2d');
-      canvas.height = viewport.height;
-      canvas.width = viewport.width;
-      scrollEl.innerHTML = '';
-      scrollEl.appendChild(canvas);
-      var task = page.render({ canvasContext: ctx, viewport: viewport });
-      return task.promise.then(function () {
-        rendering = false;
-        if (pending !== null) {
-          var p = pending;
-          pending = null;
-          renderPage(p);
-        }
-      });
-    }).catch(function (err) {
-      rendering = false;
-      setStatus('Could not render page: ' + (err && err.message ? err.message : err), true);
+  function withTimeout(promise, ms, what) {
+    return new Promise(function (resolve, reject) {
+      var timer = setTimeout(function () { reject(new Error(what + ' took too long')); }, ms);
+      promise.then(
+        function (value) { clearTimeout(timer); resolve(value); },
+        function (err) { clearTimeout(timer); reject(err); }
+      );
     });
   }
 
-  function queue(num) {
-    if (num < 1 || (pdfDoc && num > pdfDoc.numPages)) return;
-    pageNum = num;
-    updateControls();
-    if (rendering) {
-      pending = num;
-    } else {
-      renderPage(num);
-    }
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = function () { reject(new Error('could not load ' + src)); };
+      document.head.appendChild(s);
+    });
   }
 
-  function loadPdfJs() {
-    setStatus('Loading PDF.js…');
-    if (window.pdfjsLib) {
-      startViewer();
-      return;
-    }
-    var s = document.createElement('script');
-    s.src = PDFJS_CDN + '/pdf.min.js';
-    s.onload = function () {
-      if (!window.pdfjsLib) {
-        setStatus('PDF.js loaded but pdfjsLib is missing. Try a different browser.', true);
-        return;
+  // The newest PDF.js is an ES module; the old 3.x release is a classic script that works
+  // on much older engines (smart TVs). import() is called through Function so that a browser
+  // too old to parse it fails here, where it is caught, instead of breaking this whole script.
+  function loadEngine(name) {
+    var v = versions[name];
+    if (name === 'latest') {
+      var load;
+      try { load = new Function('u', 'return import(u)'); } catch (e) {
+        return Promise.reject(new Error('this browser cannot load modern scripts'));
       }
-      window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_CDN + '/pdf.worker.min.js';
-      startViewer();
-    };
-    s.onerror = function () {
-      setStatus(
-        'Could not load PDF.js from the CDN (network blocked or offline). ' +
-        'Open the PDF in a normal browser tab, or download it if your environment allows.',
-        true
-      );
-    };
-    document.head.appendChild(s);
+      return withTimeout(load(CDN + v + '/pdf.min.mjs'), 20000, 'loading PDF.js ' + v)
+        .then(function (lib) {
+          lib.GlobalWorkerOptions.workerSrc = CDN + v + '/pdf.worker.min.mjs';
+          return lib;
+        });
+    }
+    return withTimeout(loadScript(CDN + v + '/pdf.min.js'), 20000, 'loading PDF.js ' + v)
+      .then(function () {
+        if (!window.pdfjsLib) throw new Error('PDF.js loaded but pdfjsLib is missing');
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = CDN + v + '/pdf.worker.min.js';
+        return window.pdfjsLib;
+      });
   }
 
-  function startViewer() {
-    setStatus('Opening PDF…');
+  function openDocument(lib) {
     // isEvalSupported:false is Mozilla's mitigation for CVE-2024-4367 (a crafted PDF font
-    // could run script in this page); it must stay off for this PDF.js version.
-    var loadingTask = window.pdfjsLib.getDocument({
+    // could run script in this page); keep it for every version.
+    var task = lib.getDocument({
       url: pdfUrl,
       withCredentials: false,
       isEvalSupported: false,
       enableXfa: false
     });
-    loadingTask.promise.then(function (pdf) {
-      pdfDoc = pdf;
-      setStatus('');
-      queue(1);
-    }).catch(function (err) {
-      setStatus(
-        'Failed to open PDF: ' + (err && err.message ? err.message : err) +
-        '. The file may be corrupt, password-protected, or blocked.',
-        true
-      );
+    return withTimeout(task.promise, 45000, 'opening the PDF');
+  }
+
+  // Draws one page into a fresh canvas and swaps it in when it is done.
+  function drawPage(pdf, num) {
+    return pdf.getPage(num).then(function (page) {
+      var viewport = page.getViewport({ scale: scale });
+      var canvas = document.createElement('canvas');
+      var ctx = canvas.getContext('2d');
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+      var task = page.render({ canvasContext: ctx, canvas: canvas, viewport: viewport });
+      return task.promise.then(function () {
+        scrollEl.innerHTML = '';
+        scrollEl.appendChild(canvas);
+      });
     });
+  }
+
+  function run(num) {
+    rendering = true;
+    drawPage(pdfDoc, num).then(function () {
+      rendering = false;
+      if (pending !== null) {
+        var p = pending;
+        pending = null;
+        run(p);
+      }
+    }).catch(function (err) {
+      rendering = false;
+      setStatus('Could not render page: ' + message(err), true);
+    });
+  }
+
+  function queue(num) {
+    if (!pdfDoc || num < 1 || num > pdfDoc.numPages) return;
+    pageNum = num;
+    updateControls();
+    if (rendering) {
+      pending = num;
+    } else {
+      run(num);
+    }
+  }
+
+  // An engine only counts as working once it has loaded, opened the file AND drawn page 1.
+  function tryEngine(name) {
+    setStatus('Loading PDF.js ' + versions[name] + '…');
+    return loadEngine(name).then(function (lib) {
+      setStatus('Opening PDF…');
+      return openDocument(lib).then(function (pdf) {
+        return drawPage(pdf, 1).then(function () {
+          pdfDoc = pdf;
+          pageNum = 1;
+          verLabel.textContent = 'PDF.js ' + versions[name];
+          updateControls();
+          setStatus('');
+        });
+      });
+    });
+  }
+
+  function skipLatest() {
+    try { return window.localStorage.getItem(SKIP_KEY) === versions.latest; } catch (e) { return false; }
+  }
+
+  function rememberSkip() {
+    try { window.localStorage.setItem(SKIP_KEY, versions.latest); } catch (e) {}
+  }
+
+  // Problems with the file itself: another PDF.js version would fail the same way.
+  function isFileProblem(err) {
+    var n = err && err.name;
+    return n === 'PasswordException' || n === 'InvalidPDFException' || n === 'MissingPDFException';
+  }
+
+  function engineOrder() {
+    if (mode === 'latest') return ['latest'];
+    if (mode === 'legacy') return ['legacy'];
+    return skipLatest() ? ['legacy'] : ['latest', 'legacy'];
+  }
+
+  function startViewer() {
+    var order = engineOrder();
+    (function next(i) {
+      tryEngine(order[i]).catch(function (err) {
+        var name = order[i];
+        if (!isFileProblem(err) && i + 1 < order.length) {
+          if (name === 'latest') rememberSkip();
+          setStatus('PDF.js ' + versions[name] + ' did not work here (' + message(err) +
+                    '); trying PDF.js ' + versions[order[i + 1]] + '…');
+          next(i + 1);
+          return;
+        }
+        setStatus(
+          'Could not show this PDF with PDF.js ' + versions[name] + ': ' + message(err) +
+          (isFileProblem(err)
+            ? '. The file may be corrupt or password-protected.'
+            : '. If this device has no internet access to cdnjs.cloudflare.com, PDF.js cannot load.'),
+          true
+        );
+      });
+    })(0);
   }
 
   function showPdfJs() {
@@ -1779,7 +1872,7 @@ PDFJS_VIEWER_SCRIPT = r'''
     pdfjsWrap.classList.add('active');
     btnPdfjs.style.display = 'none';
     if (btnNative) btnNative.style.display = '';
-    if (!pdfDoc) loadPdfJs();
+    if (!started) { started = true; startViewer(); }
   }
 
   function showNative() {
@@ -1807,9 +1900,9 @@ PDFJS_VIEWER_SCRIPT = r'''
     if (e.key === 'ArrowRight' || e.key === 'PageDown') { e.preventDefault(); queue(pageNum + 1); }
   });
 
-  // Auto-switch on engines that have no native PDF viewer (VIDAA / many smart-TV
-  // Chromium builds, locked-down WebViews, etc.). navigator.pdfViewerEnabled is
-  // the modern signal; older engines fall back to the plugin list.
+  // Switch automatically on engines with no native PDF viewer (VIDAA / many smart-TV
+  // Chromium builds, locked-down WebViews). navigator.pdfViewerEnabled is the modern
+  // signal; older engines fall back to the plugin list.
   function nativePdfSupported() {
     if (typeof navigator.pdfViewerEnabled === 'boolean') {
       return navigator.pdfViewerEnabled;
@@ -1828,7 +1921,7 @@ PDFJS_VIEWER_SCRIPT = r'''
     showPdfJs();
   }
 })();
-'''.replace('PDFJS_CDN', f"'{PDFJS_CDN}'")
+'''
 
 
 def is_pdf_file(path):
@@ -1978,10 +2071,14 @@ def make_pdf_library_html(entries, notice=None):
     )
 
 
-def make_pdf_viewer_html(entry, show_back, notice=None, pdfjs=True):
+def make_pdf_viewer_html(entry, show_back, notice=None, pdfjs='auto', latest=PDFJS_LATEST_VERSION):
     """The viewer page: the browser's own PDF viewer, with Mozilla's PDF.js as the fallback
-    for browsers that have none (many smart TVs and locked-down WebViews). With pdfjs=False
-    nothing is loaded from any other site and no script is included."""
+    for browsers that have none (many smart TVs and locked-down WebViews).
+
+    `pdfjs` is the mode: 'auto' (newest PDF.js, the old one as backup), 'latest', 'legacy', or
+    'off' / False, where nothing is loaded from any other site and no script is included."""
+    mode = 'off' if pdfjs is False else ('auto' if pdfjs is True else pdfjs)
+    pdfjs = mode != 'off'
     title = html.escape(entry.title)
     back = '<a href="/">&#8962; Library</a>' if show_back else ''
     src, dl = f'/pdf/{entry.id}', f'/dl/{entry.id}'
@@ -2005,6 +2102,7 @@ def make_pdf_viewer_html(entry, show_back, notice=None, pdfjs=True):
         '<button type="button" id="pdfjs-next">Next &rarr;</button>'
         '<button type="button" id="pdfjs-zoomout">&minus;</button>'
         '<button type="button" id="pdfjs-zoomin">+</button>'
+        '<span class="pg" id="pdfjs-ver"></span>'
         '</div>'
         '<div id="pdfjs-status"></div>'
         '<div id="pdfjs-scroll"></div>'
@@ -2013,7 +2111,12 @@ def make_pdf_viewer_html(entry, show_back, notice=None, pdfjs=True):
         if pdfjs
         else ''
     )
-    data_attr = f' data-pdf-url="{html.escape(src, quote=True)}"' if pdfjs else ''
+    data_attr = (
+        f' data-pdf-url="{html.escape(src, quote=True)}" data-pdfjs-mode="{html.escape(mode)}"'
+        f' data-pdfjs-latest="{html.escape(latest)}" data-pdfjs-legacy="{PDFJS_LEGACY_VERSION}"'
+        if pdfjs
+        else ''
+    )
     return (
         f'<!DOCTYPE html><html><head>{HTML_META}'
         f'<title>{title}</title><style>{PDF_CSS}{PDFJS_CSS if pdfjs else ""}{COMPAT_CSS}</style></head>'
@@ -2048,7 +2151,7 @@ class PdfHandler(ReaderHandler):
             entries = self.library.scan()
             if self.library.single and entries:
                 self._send_entry_page(
-                    lambda n: make_pdf_viewer_html(entries[0], False, n, self.pdfjs)
+                    lambda n: make_pdf_viewer_html(entries[0], False, n, *self._pdfjs())
                 )
             else:
                 self._send_entry_page(lambda n: make_pdf_library_html(entries, n))
@@ -2059,9 +2162,15 @@ class PdfHandler(ReaderHandler):
             self._send(404, b'Not found', 'text/plain; charset=utf-8')
         elif m.group(1) == 'view':
             show_back = not self.library.single
-            self._send_entry_page(lambda n: make_pdf_viewer_html(entry, show_back, n, self.pdfjs))
+            self._send_entry_page(
+                lambda n: make_pdf_viewer_html(entry, show_back, n, *self._pdfjs())
+            )
         else:
             self._send_pdf(entry, 'attachment' if m.group(1) == 'dl' else 'inline')
+
+    def _pdfjs(self):
+        """(mode, newest version) for the viewer page."""
+        return (self.pdfjs_mode if self.pdfjs else 'off'), self.pdfjs_latest
 
     def _send_pdf(self, entry, disposition):
         gone = (b'That PDF is no longer available', 'text/plain; charset=utf-8')
@@ -2246,10 +2355,15 @@ auto_apply_custom_settings = yes
 # allow_scripts = no
 # allow_remote = no
 
-# PDF pages: let browsers that have no PDF viewer of their own (many smart TVs, e.g. VIDAA)
-# use PDF.js, which is loaded from cdnjs.cloudflare.com only when needed. "no" never contacts
-# any other site.
-# pdfjs = yes
+# PDF pages: browsers that have no PDF viewer of their own (many smart TVs, e.g. VIDAA) use
+# PDF.js, loaded from cdnjs.cloudflare.com only when needed.
+#   auto   - try the newest PDF.js first and fall back to the old 3.11.174 if it doesn't work
+#            on that device (the default)
+#   latest - the newest only         legacy - the old 3.11.174 only
+#   off    - never load anything from another site (same as "no")
+# pdfjs = auto
+# Which version "latest" means (default: the one this script was released with).
+# pdfjs_latest_version = 6.5.438
 
 # A book, PDF or folder to serve when none is given on the command line, so that
 # running the script with no arguments opens the book you want.
@@ -2266,6 +2380,7 @@ CONFIG_KEYS = (
     'allow_scripts',
     'allow_remote',
     'pdfjs',
+    'pdfjs_latest_version',
     'path',
 )
 
@@ -2345,13 +2460,19 @@ def read_config(path):
         'verbose',
         'allow_scripts',
         'allow_remote',
-        'pdfjs',
     ):
         if key in section:
             try:
                 settings[key] = section.getboolean(key)
             except ValueError:
                 raise ConfigError(f'"{key}" must be yes or no, not "{section[key]}"') from None
+    if 'pdfjs' in section:
+        settings['pdfjs'] = parse_pdfjs_mode(section['pdfjs'], ConfigError)
+    if 'pdfjs_latest_version' in section:
+        try:
+            settings['pdfjs_latest_version'] = pdfjs_version_text(section['pdfjs_latest_version'])
+        except argparse.ArgumentTypeError as exc:
+            raise ConfigError(f'"pdfjs_latest_version": {exc}') from None
     if 'port' in section:
         try:
             settings['port'] = port_number(section['port'].strip())
@@ -2404,6 +2525,26 @@ def write_new_file_atomically(target, text):
             temp.unlink()
         except OSError:
             pass
+
+
+def parse_pdfjs_mode(text, error=ValueError):
+    """auto / latest / legacy / off; yes means auto and no means off."""
+    word = text.strip().lower()
+    word = {'yes': 'auto', 'true': 'auto', 'on': 'auto', '1': 'auto'}.get(word, word)
+    word = {'no': 'off', 'false': 'off', '0': 'off'}.get(word, word)
+    if word not in PDFJS_MODES:
+        raise error(
+            f'"pdfjs" must be auto, latest, legacy or off (yes and no also work), not "{text.strip()}"'
+        )
+    return word
+
+
+def pdfjs_version_text(text):
+    """argparse type: a PDF.js version number such as 6.5.438 (it ends up in a URL)."""
+    value = text.strip()
+    if not _PDFJS_VERSION_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError(f'{value!r} is not a version number like 6.5.438')
+    return value
 
 
 def init_config(target):
@@ -2510,10 +2651,25 @@ def main():
         help='let EPUBs run their own JavaScript (blocked by default; only for books you trust)',
     )
     parser.add_argument(
+        '--pdfjs',
+        metavar='MODE',
+        type=lambda text: parse_pdfjs_mode(text, argparse.ArgumentTypeError),
+        default=None,
+        help='PDF.js fallback viewer for browsers with no PDF viewer of their own (many smart TVs; '
+        'loaded from cdnjs.cloudflare.com): auto = newest, with the old 3.11.174 as backup '
+        '(default); latest = newest only; legacy = old only; off = never load it',
+    )
+    parser.add_argument(
         '--no-pdfjs',
         action='store_true',
-        help='never use the PDF.js fallback viewer (it is loaded from cdnjs.cloudflare.com, and only '
-        'for browsers with no PDF viewer of their own, e.g. many smart TVs)',
+        help='same as --pdfjs off',
+    )
+    parser.add_argument(
+        '--pdfjs-latest-version',
+        metavar='X.Y.Z',
+        type=pdfjs_version_text,
+        default=None,
+        help=f'which PDF.js release "latest" means (default {PDFJS_LATEST_VERSION})',
     )
     parser.add_argument(
         '--allow-remote',
@@ -2583,7 +2739,12 @@ def main():
     args.no_browser = args.no_browser or not settings.get('open_browser', True)
     for flag in ('verbose', 'allow_scripts', 'allow_remote'):
         setattr(args, flag, getattr(args, flag) or settings.get(flag, False))
-    args.no_pdfjs = args.no_pdfjs or not settings.get('pdfjs', True)
+    if args.no_pdfjs and args.pdfjs not in (None, 'off'):
+        parser.error('--no-pdfjs cannot be combined with --pdfjs ' + args.pdfjs)
+    args.pdfjs = 'off' if args.no_pdfjs else args.pdfjs or settings.get('pdfjs', 'auto')
+    args.pdfjs_latest_version = (
+        args.pdfjs_latest_version or settings.get('pdfjs_latest_version') or PDFJS_LATEST_VERSION
+    )
     args.epub = args.epub or settings.get('path')
     if not args.epub:
         parser.error(
@@ -2605,11 +2766,19 @@ def main():
         print(f'hosting {count} PDF file{"" if count == 1 else "s"} from {library.root}')
         PdfHandler.library = library
         PdfHandler.verbose = args.verbose
-        PdfHandler.pdfjs = not args.no_pdfjs
+        PdfHandler.pdfjs = args.pdfjs != 'off'
+        PdfHandler.pdfjs_mode = args.pdfjs if PdfHandler.pdfjs else 'auto'
+        PdfHandler.pdfjs_latest = args.pdfjs_latest_version
         if PdfHandler.pdfjs:
+            newest, old = args.pdfjs_latest_version, PDFJS_LEGACY_VERSION
+            plan = {
+                'auto': f'PDF.js {newest}, with {old} as backup',
+                'latest': f'PDF.js {newest} only',
+                'legacy': f'PDF.js {old} only',
+            }[args.pdfjs]
             print(
-                'PDF.js fallback is on: browsers with no PDF viewer of their own (many smart TVs) '
-                'load it from cdnjs.cloudflare.com; --no-pdfjs turns it off'
+                f'PDF.js fallback is on ({plan}): browsers with no PDF viewer of their own '
+                '(many smart TVs) load it from cdnjs.cloudflare.com; --pdfjs off turns it off'
             )
         run_server(PdfHandler, args.host, args.port, args.no_browser)
         return
