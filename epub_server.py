@@ -1110,10 +1110,15 @@ _BROWSER_TOKENS = (
     ('CriOS/', 'Chrome', r'CriOS/(\d+)'),
     ('Safari/', 'Safari', r'Version/(\d+)'),
 )
-_PDF_INLINE_TROUBLE_RE = re.compile(r'Android|iPhone|iPad|iPod|Mobile|Silk|Kindle', re.IGNORECASE)
+# Phones/tablets + smart-TV engines (VIDAA/Hisense "Odin", many other TV browsers)
+# that usually ship without a usable native PDF plugin.
+_PDF_INLINE_TROUBLE_RE = re.compile(
+    r'Android|iPhone|iPad|iPod|Mobile|Silk|Kindle|VIDAA|SmartTV|Hisense|Odin/|Web0S|Tizen|WebOS',
+    re.IGNORECASE,
+)
 
 
-def assess_browser(user_agent, for_pdf=False):
+def assess_browser(user_agent, for_pdf=False, pdfjs=True):
     """A short heads-up for browsers this reader may not work well in, or None.
 
     A User-Agent can be wrong or missing, so this only ever *advises*: the page is
@@ -1160,12 +1165,24 @@ def assess_browser(user_agent, for_pdf=False):
                 else 'This looks like an unusual or text-mode browser'
             )
     if for_pdf and _PDF_INLINE_TROUBLE_RE.search(ua):
-        notes.append(
-            'phones and tablets often cannot show a PDF inside a page (some show only the '
-            'first page) - if it looks wrong, use "Open in new tab" or "Download"'
-        )
+        if pdfjs:
+            notes.append(
+                'phones, tablets and many smart-TV browsers (including VIDAA / Hisense) often '
+                'have no native PDF viewer - the page should switch to the PDF.js viewer '
+                'automatically; if not, use the "PDF.js viewer" button'
+            )
+        else:
+            notes.append(
+                'phones, tablets and smart TVs often cannot show a PDF inside a page - if it '
+                'looks wrong, use "Open in new tab" or "Download" (the PDF.js viewer is switched '
+                'off on this server)'
+            )
     if for_pdf and ('MSIE ' in ua or 'Trident/' in ua):
-        notes.append('it has no built-in PDF viewer, so use "Download"')
+        notes.append(
+            'it has no built-in PDF viewer - try "PDF.js viewer" or "Download"'
+            if pdfjs
+            else 'it has no built-in PDF viewer, so use "Download"'
+        )
     if not notes:
         return None
     text = '; '.join(notes)
@@ -1330,6 +1347,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
     csp = None  # Content-Security-Policy to send with every response, if set
     chapter_cache = None  # ByteLRU of processed chapters, if set
     for_pdf = False  # whether entry pages host PDFs (changes the browser heads-up)
+    pdfjs = True  # whether the PDF viewer may fall back to PDF.js (loaded from a CDN)
     allowed_hosts = None  # accepted Host header names (DNS-rebinding defence), if set
     timeout = 60  # seconds a client may stall on the socket before its connection is dropped
     security_headers = {
@@ -1515,7 +1533,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
     def _send_entry_page(self, make_html):
         """Send an entry page (contents, PDF library or viewer). It may carry a browser
         heads-up, so it varies with the User-Agent and caches are told so."""
-        notice = assess_browser(self.headers.get('User-Agent'), for_pdf=self.for_pdf)
+        notice = assess_browser(self.headers.get('User-Agent'), self.for_pdf, self.pdfjs)
         self._send(
             200,
             make_html(notice).encode(),
@@ -1602,14 +1620,215 @@ PDF_CSS = (
     'display:flex;flex-direction:column}'
     '#bar{background:#222;color:#eee;font-size:14px;padding:8px 14px;display:flex;'
     'flex-wrap:wrap;gap:8px 16px;align-items:center}'
-    '#bar a{color:#9cf;text-decoration:none;white-space:nowrap}'
-    '#bar a:hover{text-decoration:underline}'
+    '#bar a,#bar button{color:#9cf;text-decoration:none;white-space:nowrap;'
+    'background:none;border:0;padding:0;font:inherit;cursor:pointer}'
+    '#bar a:hover,#bar button:hover{text-decoration:underline}'
     '#bar .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:0 1 auto}'
     '#bar .sp{flex:1 1 auto}'
     'body.viewer .compat{margin:0;border-radius:0;border-width:0 0 1px}'
-    'object{flex:1 1 auto;width:100%;border:0}'
+    'object,#native-wrap{flex:1 1 auto;width:100%;border:0;min-height:0}'
     'object p{padding:16px}'
 )
+
+# Only sent with the PDF.js fallback viewer, so a server run with --no-pdfjs has none of it.
+PDFJS_CSS = (
+    '#pdfjs-wrap{display:none;flex:1 1 auto;flex-direction:column;min-height:0;'
+    'background:#525659}'
+    '#pdfjs-wrap.active{display:flex}'
+    '#pdfjs-toolbar{background:#323639;color:#eee;font-size:13px;padding:6px 12px;'
+    'display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center}'
+    '#pdfjs-toolbar button{background:#4a4d50;color:#eee;border:0;border-radius:3px;'
+    'padding:4px 10px;cursor:pointer;font:inherit}'
+    '#pdfjs-toolbar button:hover{background:#5c5f63}'
+    '#pdfjs-toolbar button:disabled{opacity:.4;cursor:default}'
+    '#pdfjs-toolbar .pg{min-width:4.5em;text-align:center}'
+    '#pdfjs-scroll{flex:1 1 auto;overflow:auto;text-align:center;padding:12px}'
+    '#pdfjs-scroll canvas{display:block;margin:0 auto 12px;box-shadow:0 2px 8px rgba(0,0,0,.4)}'
+    '#pdfjs-status{color:#ccc;padding:24px;font:14px sans-serif}'
+    '#pdfjs-status.error{color:#f88}'
+)
+
+# Pinned Mozilla PDF.js (CDN). Used only as a fallback when the browser has no
+# native PDF plugin. Same-origin fetch of the PDF still works even when the
+# browser's "Download" UI is disabled.
+# 3.11.x still ships a classic UMD build that sets window.pdfjsLib (4+ is
+# ESM-first and harder to load from a plain <script> in restricted engines).
+PDFJS_VERSION = '3.11.174'
+PDFJS_CDN = f'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/{PDFJS_VERSION}'
+
+PDFJS_VIEWER_SCRIPT = r'''
+(function () {
+  var pdfUrl = document.body.getAttribute('data-pdf-url');
+  var nativeWrap = document.getElementById('native-wrap');
+  var pdfjsWrap = document.getElementById('pdfjs-wrap');
+  var statusEl = document.getElementById('pdfjs-status');
+  var scrollEl = document.getElementById('pdfjs-scroll');
+  var pageLabel = document.getElementById('pdfjs-page');
+  var btnPrev = document.getElementById('pdfjs-prev');
+  var btnNext = document.getElementById('pdfjs-next');
+  var btnZoomIn = document.getElementById('pdfjs-zoomin');
+  var btnZoomOut = document.getElementById('pdfjs-zoomout');
+  var btnNative = document.getElementById('btn-native');
+  var btnPdfjs = document.getElementById('btn-pdfjs');
+  var pdfDoc = null;
+  var pageNum = 1;
+  var scale = 1.1;
+  var rendering = false;
+  var pending = null;
+
+  function setStatus(msg, isError) {
+    statusEl.textContent = msg || '';
+    statusEl.className = isError ? 'error' : '';
+    statusEl.style.display = msg ? 'block' : 'none';
+  }
+
+  function updateControls() {
+    if (!pdfDoc) return;
+    pageLabel.textContent = pageNum + ' / ' + pdfDoc.numPages;
+    btnPrev.disabled = pageNum <= 1;
+    btnNext.disabled = pageNum >= pdfDoc.numPages;
+  }
+
+  function renderPage(num) {
+    rendering = true;
+    pdfDoc.getPage(num).then(function (page) {
+      var viewport = page.getViewport({ scale: scale });
+      var canvas = document.createElement('canvas');
+      var ctx = canvas.getContext('2d');
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+      scrollEl.innerHTML = '';
+      scrollEl.appendChild(canvas);
+      var task = page.render({ canvasContext: ctx, viewport: viewport });
+      return task.promise.then(function () {
+        rendering = false;
+        if (pending !== null) {
+          var p = pending;
+          pending = null;
+          renderPage(p);
+        }
+      });
+    }).catch(function (err) {
+      rendering = false;
+      setStatus('Could not render page: ' + (err && err.message ? err.message : err), true);
+    });
+  }
+
+  function queue(num) {
+    if (num < 1 || (pdfDoc && num > pdfDoc.numPages)) return;
+    pageNum = num;
+    updateControls();
+    if (rendering) {
+      pending = num;
+    } else {
+      renderPage(num);
+    }
+  }
+
+  function loadPdfJs() {
+    setStatus('Loading PDF.js…');
+    if (window.pdfjsLib) {
+      startViewer();
+      return;
+    }
+    var s = document.createElement('script');
+    s.src = PDFJS_CDN + '/pdf.min.js';
+    s.onload = function () {
+      if (!window.pdfjsLib) {
+        setStatus('PDF.js loaded but pdfjsLib is missing. Try a different browser.', true);
+        return;
+      }
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_CDN + '/pdf.worker.min.js';
+      startViewer();
+    };
+    s.onerror = function () {
+      setStatus(
+        'Could not load PDF.js from the CDN (network blocked or offline). ' +
+        'Open the PDF in a normal browser tab, or download it if your environment allows.',
+        true
+      );
+    };
+    document.head.appendChild(s);
+  }
+
+  function startViewer() {
+    setStatus('Opening PDF…');
+    // isEvalSupported:false is Mozilla's mitigation for CVE-2024-4367 (a crafted PDF font
+    // could run script in this page); it must stay off for this PDF.js version.
+    var loadingTask = window.pdfjsLib.getDocument({
+      url: pdfUrl,
+      withCredentials: false,
+      isEvalSupported: false,
+      enableXfa: false
+    });
+    loadingTask.promise.then(function (pdf) {
+      pdfDoc = pdf;
+      setStatus('');
+      queue(1);
+    }).catch(function (err) {
+      setStatus(
+        'Failed to open PDF: ' + (err && err.message ? err.message : err) +
+        '. The file may be corrupt, password-protected, or blocked.',
+        true
+      );
+    });
+  }
+
+  function showPdfJs() {
+    nativeWrap.style.display = 'none';
+    pdfjsWrap.classList.add('active');
+    btnPdfjs.style.display = 'none';
+    if (btnNative) btnNative.style.display = '';
+    if (!pdfDoc) loadPdfJs();
+  }
+
+  function showNative() {
+    pdfjsWrap.classList.remove('active');
+    nativeWrap.style.display = '';
+    if (btnNative) btnNative.style.display = 'none';
+    btnPdfjs.style.display = '';
+  }
+
+  if (btnPdfjs) btnPdfjs.addEventListener('click', showPdfJs);
+  if (btnNative) btnNative.addEventListener('click', showNative);
+  btnPrev.addEventListener('click', function () { queue(pageNum - 1); });
+  btnNext.addEventListener('click', function () { queue(pageNum + 1); });
+  btnZoomIn.addEventListener('click', function () {
+    scale = Math.min(scale + 0.2, 3);
+    queue(pageNum);
+  });
+  btnZoomOut.addEventListener('click', function () {
+    scale = Math.max(scale - 0.2, 0.4);
+    queue(pageNum);
+  });
+  document.addEventListener('keydown', function (e) {
+    if (!pdfjsWrap.classList.contains('active')) return;
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); queue(pageNum - 1); }
+    if (e.key === 'ArrowRight' || e.key === 'PageDown') { e.preventDefault(); queue(pageNum + 1); }
+  });
+
+  // Auto-switch on engines that have no native PDF viewer (VIDAA / many smart-TV
+  // Chromium builds, locked-down WebViews, etc.). navigator.pdfViewerEnabled is
+  // the modern signal; older engines fall back to the plugin list.
+  function nativePdfSupported() {
+    if (typeof navigator.pdfViewerEnabled === 'boolean') {
+      return navigator.pdfViewerEnabled;
+    }
+    try {
+      var plugs = navigator.plugins;
+      if (!plugs || !plugs.length) return false;
+      for (var i = 0; i < plugs.length; i++) {
+        var name = (plugs[i].name || '') + ' ' + (plugs[i].filename || '');
+        if (/pdf/i.test(name)) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  if (!nativePdfSupported()) {
+    showPdfJs();
+  }
+})();
+'''.replace('PDFJS_CDN', f"'{PDFJS_CDN}'")
 
 
 def is_pdf_file(path):
@@ -1759,21 +1978,59 @@ def make_pdf_library_html(entries, notice=None):
     )
 
 
-def make_pdf_viewer_html(entry, show_back, notice=None):
+def make_pdf_viewer_html(entry, show_back, notice=None, pdfjs=True):
+    """The viewer page: the browser's own PDF viewer, with Mozilla's PDF.js as the fallback
+    for browsers that have none (many smart TVs and locked-down WebViews). With pdfjs=False
+    nothing is loaded from any other site and no script is included."""
     title = html.escape(entry.title)
     back = '<a href="/">&#8962; Library</a>' if show_back else ''
     src, dl = f'/pdf/{entry.id}', f'/dl/{entry.id}'
+    pdfjs_buttons = (
+        '<button type="button" id="btn-pdfjs">PDF.js viewer</button>'
+        '<button type="button" id="btn-native" style="display:none">Native viewer</button>'
+        if pdfjs
+        else ''
+    )
+    hint = (
+        'or use the <strong>PDF.js viewer</strong> button above '
+        '(works even when the native plugin and download UI are disabled).'
+        if pdfjs
+        else ''
+    )
+    pdfjs_panel = (
+        '<div id="pdfjs-wrap">'
+        '<div id="pdfjs-toolbar">'
+        '<button type="button" id="pdfjs-prev">&larr; Prev</button>'
+        '<span class="pg" id="pdfjs-page">&ndash;</span>'
+        '<button type="button" id="pdfjs-next">Next &rarr;</button>'
+        '<button type="button" id="pdfjs-zoomout">&minus;</button>'
+        '<button type="button" id="pdfjs-zoomin">+</button>'
+        '</div>'
+        '<div id="pdfjs-status"></div>'
+        '<div id="pdfjs-scroll"></div>'
+        '</div>'
+        f'<script>{PDFJS_VIEWER_SCRIPT}</script>'
+        if pdfjs
+        else ''
+    )
+    data_attr = f' data-pdf-url="{html.escape(src, quote=True)}"' if pdfjs else ''
     return (
         f'<!DOCTYPE html><html><head>{HTML_META}'
-        f'<title>{title}</title><style>{PDF_CSS}{COMPAT_CSS}</style></head><body class="viewer">'
-        f'{compat_banner(notice)}<div id="bar">{back}<span class="t" title="{title}">{title}</span>'
-        f'<span class="sp"></span>'
+        f'<title>{title}</title><style>{PDF_CSS}{PDFJS_CSS if pdfjs else ""}{COMPAT_CSS}</style></head>'
+        f'<body class="viewer"{data_attr}>'
+        f'{compat_banner(notice)}'
+        f'<div id="bar">{back}<span class="t" title="{title}">{title}</span>'
+        f'<span class="sp"></span>{pdfjs_buttons}'
         f'<a href="{src}" target="_blank">Open in new tab</a>'
         f'<a href="{dl}">Download</a></div>'
+        f'<div id="native-wrap">'
         f'<object data="{src}" type="application/pdf">'
-        f'<p>Your browser can\'t show PDFs inline. '
-        f'<a href="{src}">Open it</a> or <a href="{dl}">download it</a>.</p>'
-        f'</object></body></html>'
+        f"<p>Your browser can't show PDFs inline. "
+        f'<a href="{src}">Open it</a> or <a href="{dl}">download it</a>'
+        f'{", " + hint if hint else "."}</p>'
+        f'</object></div>'
+        f'{pdfjs_panel}'
+        f'</body></html>'
     )
 
 
@@ -1790,7 +2047,9 @@ class PdfHandler(ReaderHandler):
         if path == '/':
             entries = self.library.scan()
             if self.library.single and entries:
-                self._send_entry_page(lambda n: make_pdf_viewer_html(entries[0], False, n))
+                self._send_entry_page(
+                    lambda n: make_pdf_viewer_html(entries[0], False, n, self.pdfjs)
+                )
             else:
                 self._send_entry_page(lambda n: make_pdf_library_html(entries, n))
             return
@@ -1800,7 +2059,7 @@ class PdfHandler(ReaderHandler):
             self._send(404, b'Not found', 'text/plain; charset=utf-8')
         elif m.group(1) == 'view':
             show_back = not self.library.single
-            self._send_entry_page(lambda n: make_pdf_viewer_html(entry, show_back, n))
+            self._send_entry_page(lambda n: make_pdf_viewer_html(entry, show_back, n, self.pdfjs))
         else:
             self._send_pdf(entry, 'attachment' if m.group(1) == 'dl' else 'inline')
 
@@ -1987,6 +2246,11 @@ auto_apply_custom_settings = yes
 # allow_scripts = no
 # allow_remote = no
 
+# PDF pages: let browsers that have no PDF viewer of their own (many smart TVs, e.g. VIDAA)
+# use PDF.js, which is loaded from cdnjs.cloudflare.com only when needed. "no" never contacts
+# any other site.
+# pdfjs = yes
+
 # A book, PDF or folder to serve when none is given on the command line, so that
 # running the script with no arguments opens the book you want.
 # A relative path is relative to this file's folder.  ~ means your home folder.
@@ -2001,6 +2265,7 @@ CONFIG_KEYS = (
     'verbose',
     'allow_scripts',
     'allow_remote',
+    'pdfjs',
     'path',
 )
 
@@ -2080,6 +2345,7 @@ def read_config(path):
         'verbose',
         'allow_scripts',
         'allow_remote',
+        'pdfjs',
     ):
         if key in section:
             try:
@@ -2244,6 +2510,12 @@ def main():
         help='let EPUBs run their own JavaScript (blocked by default; only for books you trust)',
     )
     parser.add_argument(
+        '--no-pdfjs',
+        action='store_true',
+        help='never use the PDF.js fallback viewer (it is loaded from cdnjs.cloudflare.com, and only '
+        'for browsers with no PDF viewer of their own, e.g. many smart TVs)',
+    )
+    parser.add_argument(
         '--allow-remote',
         action='store_true',
         help='let EPUBs load images, fonts and styles from https:// sites '
@@ -2311,6 +2583,7 @@ def main():
     args.no_browser = args.no_browser or not settings.get('open_browser', True)
     for flag in ('verbose', 'allow_scripts', 'allow_remote'):
         setattr(args, flag, getattr(args, flag) or settings.get(flag, False))
+    args.no_pdfjs = args.no_pdfjs or not settings.get('pdfjs', True)
     args.epub = args.epub or settings.get('path')
     if not args.epub:
         parser.error(
@@ -2332,6 +2605,12 @@ def main():
         print(f'hosting {count} PDF file{"" if count == 1 else "s"} from {library.root}')
         PdfHandler.library = library
         PdfHandler.verbose = args.verbose
+        PdfHandler.pdfjs = not args.no_pdfjs
+        if PdfHandler.pdfjs:
+            print(
+                'PDF.js fallback is on: browsers with no PDF viewer of their own (many smart TVs) '
+                'load it from cdnjs.cloudflare.com; --no-pdfjs turns it off'
+            )
         run_server(PdfHandler, args.host, args.port, args.no_browser)
         return
     try:

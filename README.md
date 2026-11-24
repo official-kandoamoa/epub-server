@@ -12,7 +12,9 @@ single `.pdf`, or a whole folder of them.
   disk with HTTP Range support, so large files open quickly and the browser
   can jump to any page without downloading the whole thing first. The folder is
   rescanned on every page load, so PDFs you add while the server is running
-  appear on reload. See [Hosting PDFs](#hosting-pdfs).
+  appear on reload. When the browser has no native PDF plugin (or it has been
+  stripped), a **PDF.js** fallback viewer is one click away. See
+  [Hosting PDFs](#hosting-pdfs).
 
 - **Zero dependencies** — standard library only, works anywhere Python 3
   runs, including Termux on Android.
@@ -81,16 +83,27 @@ single `.pdf`, or a whole folder of them.
   IPv6 addresses such as `--host ::1` are supported. Non-ASCII titles never
   crash a console that can't display them.
 
+- **PDFs on smart TVs and other browsers with no PDF viewer** — many TV
+  browsers (VIDAA/Hisense, Tizen, webOS...) and locked-down WebViews cannot open
+  PDFs and have no download button. When the viewer page detects that, it
+  switches by itself to [PDF.js](https://mozilla.github.io/pdf.js/) (page
+  by page, with Prev/Next, arrow keys and zoom); a "PDF.js viewer" button lets
+  you switch by hand anywhere. PDF.js is loaded from `cdnjs.cloudflare.com`
+  (version 3.11.174, pinned) **only** in that case, so the device needs
+  internet access; the PDF itself is still read from this server. It runs with
+  `isEvalSupported: false`, Mozilla's mitigation for CVE-2024-4367 (a crafted
+  PDF running script in the page). Use `--no-pdfjs` (or `pdfjs = no` in the
+  settings file) to never load anything from another site.
 - **Browser heads-up** — if your browser looks too old (older than Chrome/Edge
   84, Firefox 78, Safari/iOS 14, Opera 70, Samsung Internet 14; any Internet
   Explorer or pre-2020 Edge), or isn't one it recognises, the contents page
   shows a yellow note that things may not work but you can keep going.
   PDF pages also warn phones and tablets, which often can't show a PDF inside
-  a page, and point to "Open in new tab" / "Download". The warning only
-  advises: pages are always served in full. Scripts and tools such as `curl`,
-  and requests with no User-Agent, are never warned. The browser is guessed
-  from its User-Agent, which can be wrong; the page is marked `Vary:
-  User-Agent`, and chapters themselves are never changed.
+  a page, and point to "PDF.js viewer" / "Open in new tab" / "Download". The
+  warning only advises: pages are always served in full. Scripts and tools
+  such as `curl`, and requests with no User-Agent, are never warned. The
+  browser is guessed from its User-Agent, which can be wrong; the page is
+  marked `Vary: User-Agent`, and chapters themselves are never changed.
 
 ## Requirements
 
@@ -116,6 +129,7 @@ This starts a local server and opens your browser to it automatically.
 | `--host ADDRESS` | `127.0.0.1` | Advanced: the exact address to listen on, instead of `--only-me`/`--share` |
 | `--no-browser` | off           | Don't automatically open a browser tab                    |
 | `--verbose`    | off           | Log every request (failed requests are always logged)     |
+| `--no-pdfjs`   | off           | Never use the PDF.js fallback viewer (nothing is loaded from other sites) |
 | `--config FILE` | see below    | Read default settings from this file (see [Settings file](#settings-file-run-it-with-no-arguments)) |
 | `--no-config`  | off           | Ignore any settings file this time                        |
 | `--init-config` |              | Write a commented settings file and exit                  |
@@ -158,6 +172,7 @@ Every command-line option has a setting:
 | `verbose` | yes / no | `--verbose` |
 | `allow_scripts` | yes / no | `--allow-scripts` |
 | `allow_remote` | yes / no | `--allow-remote` |
+| `pdfjs` | yes / no | `--no-pdfjs` when `no` |
 | `path` | a book, PDF or folder | the `path` argument |
 
 `--config`, `--no-config`, `--init-config` and `--help` are about the file
@@ -262,9 +277,19 @@ Pages: `/` is the library (or the viewer, when you pointed at one file),
 inside the library, and only files found by the scan can be requested — a URL
 can't be used to reach anything else on disk.
 
-The viewer uses your browser's built-in PDF support. Some mobile browsers
-(Android Chrome, for example) don't show PDFs inline; there, use the "Open in
-new tab" or "Download" links in the viewer's top bar.
+The viewer uses your browser's built-in PDF support first. When that is
+missing or stripped — common on phones, locked-down Chromium WebViews, and
+especially **smart-TV browsers such as VIDAA OS (Hisense / Toshiba)** whose
+Chromium ("Odin") build has no PDF plugin and no useful download UI — the
+page **automatically switches to the PDF.js viewer**. You can also click
+**PDF.js viewer** in the top bar. That loads Mozilla's PDF.js from a CDN and
+renders the file client-side; the PDF itself is still fetched from this
+server (same origin), so it works even when the browser's native viewer and
+"Save as…" are disabled. It needs a network connection only for the PDF.js
+library; after that the document is local. Start with `--no-pdfjs` (or set
+`pdfjs = no`) to turn the fallback off so nothing is loaded from other sites. You
+can switch back to the native viewer with the button that appears. "Open in new tab" and "Download" remain
+available when the environment allows them.
 
 ### Troubleshooting
 
@@ -341,8 +366,11 @@ Standard library only; the suite starts real servers on free local ports.
   pages, so it may overlap content on some of them.
 - **Mix EPUBs and PDFs in one library** — a run serves either one EPUB or
   PDFs, not both. Folder mode only picks up PDFs.
-- **PDF extras** — no text search, thumbnails, or reading-progress tracking;
-  the viewer is whatever your browser provides. Password-protected PDFs are
-  served as-is, and your browser's viewer will prompt for the password.
+- **PDF extras** — no text search, thumbnails, or reading-progress tracking.
+  The primary viewer is the browser's built-in one; a PDF.js fallback (loaded
+  from a CDN) is available when the native plugin is missing or stripped.
+  Password-protected PDFs are served as-is (native viewer will prompt;
+  PDF.js currently does not unlock them). On a TV, the fallback needs the TV to
+  reach `cdnjs.cloudflare.com`; if it can't, the page says so.
 - It's read-only — nothing is ever extracted or written to disk; the epub
   (or PDF) is served directly from the file or folder you pointed it at.

@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import io
 import os
+import re
 import posixpath
 import socket
 import subprocess
@@ -1495,6 +1496,40 @@ class ConfigFileTests(TempDirCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn('not found', r.stdout)
 
+    def pdf_cli(self, *args, env=None):
+        root = self.tmp / 'pdfcli'
+        root.mkdir(exist_ok=True)
+        (root / 'a.pdf').write_bytes(b'%PDF-1.4 a')
+        cli = Cli(root / 'a.pdf', *args, env=env)
+        try:
+            page = cli.get('/').body.decode()
+        finally:
+            out, err = cli.stop()
+        return page, out
+
+    def test_pdfjs_is_on_by_default_and_the_command_line_can_turn_it_off(self):
+        page, out = self.pdf_cli()
+        self.assertIn('cdnjs.cloudflare.com', page)
+        self.assertIn('PDF.js fallback is on', out)
+        page, out = self.pdf_cli('--no-pdfjs')
+        self.assertNotIn('cdnjs', page)
+        self.assertNotIn('<script', page)
+        self.assertNotIn('PDF.js fallback is on', out)
+
+    def test_pdfjs_setting_in_the_config_file(self):
+        self.assertEqual(
+            es.read_config(self.write_config('[server]\npdfjs = no\n')), {'pdfjs': False}
+        )
+        with self.assertRaisesRegex(es.ConfigError, 'pdfjs'):
+            es.read_config(self.write_config('[server]\npdfjs = sometimes\n', 'bad.ini'))
+        config = self.write_config('[server]\npdfjs = no\n', 'off.ini')
+        page, out = self.pdf_cli('--config', config)
+        self.assertNotIn('cdnjs', page)
+        env = self.home_with('pdfauto', '[server]\nauto_apply_custom_settings = yes\npdfjs = no\n')
+        page, out = self.pdf_cli(env=env)
+        self.assertNotIn('cdnjs', page)
+        self.assertIn('(auto-applied)', out)
+
     def test_init_config_defaults_to_the_per_user_location(self):
         home = self.tmp / 'home2'
         env = isolated_env(
@@ -1578,10 +1613,27 @@ class BrowserCompatibilityTests(TempDirCase):
         for name in ('iphone', 'android_chrome', 'ios_chrome'):
             self.assertIsNone(self.notice(name, False), name)
             note = self.notice(name, True)
-            self.assertIn('often cannot show a PDF inside a page', note, name)
-            self.assertIn('Open in new tab', note)
+            self.assertIn('often have no native PDF viewer', note, name)
+            self.assertIn('PDF.js viewer', note)
+            off = es.assess_browser(self.AGENTS[name], True, pdfjs=False)
+            self.assertIn('often cannot show a PDF', off, name)
+            self.assertIn('Open in new tab', off)
+            self.assertNotIn('use the "PDF.js viewer" button', off)
         self.assertIsNone(self.notice('modern_chrome', True))
         self.assertIn('no built-in PDF viewer', self.notice('ie11', True))
+        self.assertIn('PDF.js viewer', self.notice('ie11', True))
+        self.assertNotIn('PDF.js', es.assess_browser(self.AGENTS['ie11'], True, pdfjs=False))
+
+    def test_smart_tv_browsers_are_told_about_the_pdf_fallback(self):
+        for ua in (
+            'Mozilla/5.0 (Linux; VIDAA 6.0; Hisense) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.85 Safari/537.36 VIDAA/6.0',
+            'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.5) AppleWebKit/537.36 (KHTML, like Gecko) 85.0.4183.93/6.5 TV Safari/537.36',
+            'Mozilla/5.0 (Web0S; Linux/SmartTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.128 Safari/537.36 WebAppManager',
+        ):
+            note = es.assess_browser(ua, True)
+            self.assertIn('smart-TV', note, ua)
+            self.assertIn('PDF.js', note, ua)
+            self.assertIsNone(es.assess_browser(ua, False), ua)  # EPUB pages are plain HTML
 
     def test_the_banner_never_repeats_the_user_agent_and_is_escaped(self):
         evil = 'Mozilla/5.0 <script>alert(1)</script> Chrome/5.0 evil.example'
@@ -1650,13 +1702,45 @@ class BrowserCompatibilityTests(TempDirCase):
             pages = ['/'] if single else ['/', '/view/' + library.scan()[0].id]
             for page in pages:
                 phone = srv.get(page, {'User-Agent': self.AGENTS['android_chrome']})
-                self.assertIn(b'often cannot show a PDF', phone.body, page)
-                self.assertIn(b'Open in new tab', phone.body, page)
+                self.assertIn(b'often', phone.body, page)
+                self.assertIn(b'PDF.js viewer', phone.body, page)
                 self.assertEqual(phone.headers['vary'], 'User-Agent')
                 ie = srv.get(page, {'User-Agent': self.AGENTS['ie11']})
                 self.assertIn(b'no built-in PDF viewer', ie.body, page)
                 desktop = srv.get(page, {'User-Agent': self.AGENTS['modern_chrome']})
                 self.assertNotIn(b'class="compat"', desktop.body, page)
+
+    def test_viewer_page_has_the_pdfjs_fallback_pinned_and_hardened(self):
+        srv, library = self.serve_pdfs(True)
+        page = srv.get('/').body.decode()
+        entry = library.scan()[0]
+        self.assertIn(f'data-pdf-url="/pdf/{entry.id}"', page)
+        for part in ('id="btn-pdfjs"', 'id="pdfjs-wrap"', 'id="pdfjs-scroll"', '<object data='):
+            self.assertIn(part, page)
+        # the only other site it can contact, at a fixed version
+        self.assertIn('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174', page)
+        self.assertEqual(
+            set(re.findall(r'https://[a-z0-9.-]+', page)), {'https://cdnjs.cloudflare.com'}
+        )
+        # CVE-2024-4367: a crafted PDF must not be able to run script in this page
+        self.assertIn('isEvalSupported: false', page)
+        self.assertIn('withCredentials: false', page)
+        self.assertEqual(es.PDFJS_VERSION, '3.11.174')
+
+    def test_turning_pdfjs_off_removes_every_trace_of_it(self):
+        root = self.tmp / 'nopdfjs'
+        root.mkdir()
+        (root / 'a.pdf').write_bytes(b'%PDF-1.4 a')
+        library = es.PdfLibrary(root / 'a.pdf')
+        srv = Running(quiet_handler(es.PdfHandler, library=library, pdfjs=False))
+        self.addCleanup(srv.close)
+        for ua in (self.AGENTS['android_chrome'], self.AGENTS['modern_chrome']):
+            page = srv.get('/', {'User-Agent': ua}).body.decode()
+            self.assertNotIn('<script', page)
+            self.assertNotIn('cdnjs', page)
+            self.assertNotIn('pdfjs', page.lower())
+            self.assertIn('<object data=', page)
+            self.assertIn('Download', page)
 
     def test_pdf_files_themselves_are_unaffected_by_the_user_agent(self):
         srv, library = self.serve_pdfs(False)
