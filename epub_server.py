@@ -55,6 +55,7 @@ import os
 import posixpath
 import re
 import stat
+import tempfile
 import threading
 import traceback
 import unicodedata
@@ -2109,18 +2110,78 @@ def read_config(path):
     return settings
 
 
+def write_new_file_atomically(target, text):
+    """Create `target` with `text` so that it either exists completely or not at all.
+
+    The text goes to a temporary file in the same folder first, is flushed to disk, and is
+    then put in place without overwriting anything. A crash or a full disk part-way can leave
+    a stray temporary file, never a half-written settings file. Raises FileExistsError if
+    `target` is already there."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(dir=str(target.parent), prefix='.epub_server_', suffix='.tmp')
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(str(temp), str(target))  # fails, atomically, if target exists
+        except FileExistsError:
+            raise
+        except OSError:  # a file system without hard links: check, then rename
+            if target.exists():
+                raise FileExistsError(str(target)) from None
+            os.rename(str(temp), str(target))
+    finally:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+
+
 def init_config(target):
     """Write the commented template to `target`. Returns 0, or an error message to exit with."""
-    if target.exists():
-        return f'error: {target} already exists; edit it, or remove it first to start over'
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with open(target, 'x', encoding='utf-8') as f:
-            f.write(CONFIG_TEMPLATE)
+        write_new_file_atomically(target, CONFIG_TEMPLATE)
+    except FileExistsError:
+        return f'error: {target} already exists; edit it, or remove it first to start over'
     except OSError as exc:
         return f'error: could not write {target}: {exc.strerror or exc}'
     print(f'wrote {target}\nEdit it to change the defaults; command-line options still win.')
     return 0
+
+
+def describe_config(path):
+    """(is it fine, one line saying what the file is) for `check_config`."""
+    if not path.is_file():
+        return True, 'not found (that is fine: built-in defaults are used)'
+    try:
+        found = read_config(path)
+    except ConfigError as exc:
+        return False, f'CORRUPTED or invalid: it {exc}. It will be skipped.'
+    if found.get('auto_apply_custom_settings'):
+        return True, f'valid, and applied automatically ({len(found) - 1} setting(s) changed)'
+    return (
+        True,
+        'valid, but auto_apply_custom_settings is not "yes", so it is only used with --config',
+    )
+
+
+def check_config(explicit):
+    """Report on the settings file(s) without starting a server; returns the exit status."""
+    if explicit is not None:
+        ok, message = describe_config(explicit)
+        if not explicit.is_file():
+            ok, message = False, 'not found'
+        print(f'{explicit}: {message}')
+        return 0 if ok else 1
+    status = 0
+    for candidate in (Path(__file__).resolve().with_name(CONFIG_FILE_NAME), user_config_path()):
+        ok, message = describe_config(candidate)
+        print(f'{candidate}: {message}')
+        status = status or (0 if ok else 1)
+    return status
 
 
 def port_number(text):
@@ -2203,11 +2264,18 @@ def main():
         action='store_true',
         help='write a commented settings file (to --config FILE, or the per-user location) and exit',
     )
+    configuration.add_argument(
+        '--check-config',
+        action='store_true',
+        help='report whether the settings file is valid, without starting a server',
+    )
     args = parser.parse_args()
     if args.host is not None and (args.share or args.only_me):
         parser.error('--host cannot be combined with --share or --only-me (pick one way to choose)')
     if args.config and args.no_config:
         parser.error('--config cannot be combined with --no-config')
+    if args.check_config:
+        sys.exit(check_config(Path(args.config) if args.config else None))
     if args.init_config:
         sys.exit(init_config(Path(args.config) if args.config else user_config_path()))
     settings, config_file = {}, None

@@ -1439,6 +1439,62 @@ class ConfigFileTests(TempDirCase):
         self.assertIn('already exists', again.stderr)
         self.assertEqual(target.read_text(encoding='utf-8'), es.CONFIG_TEMPLATE)
 
+    def test_a_failed_write_leaves_no_half_written_file(self):
+        target = self.tmp / 'atomic' / 'conf.ini'
+        with mock.patch.object(es.os, 'fsync', side_effect=OSError(28, 'No space left on device')):
+            result = es.init_config(target)
+        self.assertIn('could not write', result)
+        self.assertIn('No space left', result)
+        self.assertFalse(target.exists())
+        self.assertEqual(list(target.parent.iterdir()), [])  # the temporary file is cleaned up
+
+    def test_an_existing_file_is_never_touched_by_init_config(self):
+        target = self.tmp / 'precious.ini'
+        target.write_text('[server]\nport = 1234\n')
+        self.assertIn('already exists', es.init_config(target))
+        self.assertEqual(target.read_text(), '[server]\nport = 1234\n')
+        self.assertEqual([p.name for p in self.tmp.iterdir() if p.name.startswith('.epub')], [])
+
+    def test_init_config_still_works_where_hard_links_are_unavailable(self):
+        target = self.tmp / 'nolink.ini'
+        with mock.patch.object(es.os, 'link', side_effect=OSError(1, 'Operation not permitted')):
+            self.assertEqual(es.init_config(target), 0)
+        self.assertEqual(target.read_text(encoding='utf-8'), es.CONFIG_TEMPLATE)
+        self.assertEqual(
+            sorted(p.name for p in self.tmp.iterdir() if p.name.startswith('.epub')), []
+        )
+
+    def test_check_config_reports_valid_corrupted_and_missing(self):
+        good = self.write_config(
+            '[server]\nauto_apply_custom_settings = yes\nport = 9000\n', 'g.ini'
+        )
+        quiet = self.write_config('[server]\nport = 9000\n', 'q.ini')
+        bad = self.write_config('[server]\nport = nine\n', 'b.ini')
+        r = run_script('--check-config', '--config', good)
+        self.assertEqual((r.returncode, 'applied automatically' in r.stdout), (0, True))
+        r = run_script('--check-config', '--config', quiet)
+        self.assertEqual((r.returncode, 'only used with --config' in r.stdout), (0, True))
+        r = run_script('--check-config', '--config', bad)
+        self.assertEqual(
+            (r.returncode, 'CORRUPTED' in r.stdout, 'skipped' in r.stdout), (1, True, True)
+        )
+        r = run_script('--check-config', '--config', self.tmp / 'gone.ini')
+        self.assertEqual((r.returncode, 'not found' in r.stdout), (1, True))
+        self.assertNotIn('Traceback', r.stderr)
+
+    def test_check_config_without_a_name_looks_where_the_script_would(self):
+        env = self.home_with('chk', '[server]\nauto_apply_custom_settings = yes\nport = 9000\n')
+        r = run_script('--check-config', env=env)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('applied automatically', r.stdout)
+        env = self.home_with('chk2', '[server]\nport = nine\n')
+        r = run_script('--check-config', env=env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('CORRUPTED', r.stdout)
+        r = run_script('--check-config', env=self.home_with('chk3'))
+        self.assertEqual(r.returncode, 0)
+        self.assertIn('not found', r.stdout)
+
     def test_init_config_defaults_to_the_per_user_location(self):
         home = self.tmp / 'home2'
         env = isolated_env(
