@@ -415,7 +415,12 @@ def sniff_text(raw):
         or re.search(r'@charset\s+["\']([\w-]+)["\']', head, re.IGNORECASE)
         or re.search(r'charset=["\']?([\w-]+)', head, re.IGNORECASE)
     )
-    for enc in filter(None, [m.group(1) if m else None, 'utf-8']):
+    seen, encodings = set(), []
+    for enc in (m.group(1) if m else None, 'utf-8'):
+        if enc and enc.lower() not in seen:
+            seen.add(enc.lower())
+            encodings.append(enc)
+    for enc in encodings:
         try:
             return raw.decode(enc)
         except (UnicodeDecodeError, LookupError):
@@ -429,7 +434,9 @@ def resolve_href(href, base_dir):
     if not path_part:
         return '', frag
     full = posixpath.join(base_dir, path_part) if base_dir else path_part
-    return posixpath.normpath(full), frag
+    # EPUB paths are package-relative; a leading slash (seen in some encryption.xml
+    # URIs and OPF hrefs) is noise and would otherwise never match zip/folder entries.
+    return posixpath.normpath(full).lstrip('/'), frag
 
 
 def is_rtl_language(lang):
@@ -606,6 +613,8 @@ class Book:
         self.has_drm = bool(self.drm_paths)
         self.cover = self._resolve_cover()
         self._titles = {}  # chapter path -> title, filled in on demand by title_for()
+        # Precompute once: make_nav_bar used to re-canonicalize the whole spine on every chapter.
+        self._spine_keys = [self._key(p) for p in self.spine]
         try:
             self.toc = self._build_toc()
         except Exception as exc:
@@ -799,6 +808,14 @@ class Book:
             raw = self.source.read('META-INF/encryption.xml')
         except (KeyError, FileNotFoundError):
             return {}, {}
+        except (UnsupportedContentError, ResourceTooLargeError) as exc:
+            # A password-protected or oversized encryption.xml shouldn't kill the whole book;
+            # treat it as missing and warn so the user knows DRM detection was skipped.
+            warn(
+                f'META-INF/encryption.xml could not be read ({exc}); protected content, '
+                'if there is any, will not be detected and may show up as garbage'
+            )
+            return {}, {}
         try:
             root = parse_xml(raw)
         except ET.ParseError as exc:
@@ -956,10 +973,13 @@ class Book:
             text = text[:TITLE_SCAN_CHARS]
             for name in ('title', 'h1'):  # a blank <title> falls through to the <h1>
                 inner = first_real_element_text(text, name)
-                clean = html.unescape(TAG_RE.sub('', inner)).strip() if inner is not None else ''
-                if clean:
-                    title = clean
-                    break
+                if inner is not None:
+                    # Collapse internal whitespace the same way TOC parsing does, so a
+                    # multi-line <title> doesn't put newlines into the nav bar attribute.
+                    clean = ' '.join(html.unescape(TAG_RE.sub('', inner)).split())
+                    if clean:
+                        title = clean
+                        break
         self._titles[path] = title
         return title
 
@@ -1000,8 +1020,9 @@ def make_link(path, fragment=''):
 
 
 def make_nav_bar(book, current_path, text=None):
-    keys = [book._key(p) for p in book.spine]  # same spelling rules as DRM checks (NFC etc.)
-    idx = keys.index(book._key(current_path)) if book._key(current_path) in keys else -1
+    keys = book._spine_keys  # precomputed in Book.__init__ (NFC / zip-name canonical form)
+    current_key = book._key(current_path)
+    idx = keys.index(current_key) if current_key in keys else -1
     prev = f'<a href="{make_link(book.spine[idx-1])}">&#8592; Prev</a>' if idx > 0 else ''
     nxt = (
         f'<a href="{make_link(book.spine[idx+1])}">Next &#8594;</a>'
@@ -1224,8 +1245,8 @@ def numeric_entities(text):
     parsers (expat, and the browser's) only honour the XHTML set when the
     document carries a matching DOCTYPE - plenty of books use &nbsp; under an
     HTML5 doctype or none at all. Numeric references are valid everywhere.
-    Comments and CDATA sections are left alone: there, "&nbsp;" is literal
-    text (e.g. a code sample) and must stay exactly as written."""
+    Comments, CDATA sections, and <script>/<style> blocks are left alone: there,
+    "&nbsp;" is literal text (e.g. a code sample) and must stay exactly as written."""
 
     def repl(m):
         name = m.group(1)
@@ -1235,7 +1256,7 @@ def numeric_entities(text):
         return f'&#{codepoint};' if codepoint is not None else m.group(0)
 
     out, pos = [], 0
-    for start, end in skipped_spans(text, comments_only=True):
+    for start, end in skipped_spans(text, comments_only=False):
         out.append(_ENTITY_REF_RE.sub(repl, text[pos:start]))
         out.append(text[start:end])
         pos = end
@@ -1977,40 +1998,39 @@ class PdfLibrary:
     def find(self, entry_id):
         """The entry with this id: from the last scan, else (a PDF added since) a fresh one."""
         entry = self._by_id.get(entry_id)
-        if entry is None:
-            with self._scan_lock:  # concurrent misses share one rescan
-                entry = self._by_id.get(entry_id)
-                if entry is None:
-                    self.scan()
-                    entry = self._by_id.get(entry_id)
-        return entry
+        if entry is not None:
+            return entry
+        # scan() holds the lock; concurrent misses share one rescan.
+        self.scan()
+        return self._by_id.get(entry_id)
 
     def scan(self):
-        if self.single:
-            found, base = [self.root], self.root.parent
-        else:
-            found, base = [], self.root
-            for dirpath, dirnames, filenames in os.walk(self.root):
-                dirnames[:] = sorted(d for d in dirnames if not d.startswith('.'))
-                found.extend(
-                    Path(dirpath, f)
-                    for f in sorted(filenames)
-                    if f.lower().endswith('.pdf') and not f.startswith('.')
-                )
-            found.sort(key=lambda p: str(p.relative_to(base)).lower())
-        entries = []
-        for p in found:
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            if not stat.S_ISREG(st.st_mode) or not self.is_inside(p):
-                continue
-            rel = p.relative_to(base).as_posix()
-            entry_id = hashlib.sha1(rel.encode('utf-8', 'surrogateescape')).hexdigest()[:12]
-            entries.append(PdfEntry(entry_id, p, rel, p.stem, st.st_size))
-        self._by_id = {e.id: e for e in entries}
-        return entries
+        with self._scan_lock:
+            if self.single:
+                found, base = [self.root], self.root.parent
+            else:
+                found, base = [], self.root
+                for dirpath, dirnames, filenames in os.walk(self.root):
+                    dirnames[:] = sorted(d for d in dirnames if not d.startswith('.'))
+                    found.extend(
+                        Path(dirpath, f)
+                        for f in sorted(filenames)
+                        if f.lower().endswith('.pdf') and not f.startswith('.')
+                    )
+                found.sort(key=lambda p: str(p.relative_to(base)).lower())
+            entries = []
+            for p in found:
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode) or not self.is_inside(p):
+                    continue
+                rel = p.relative_to(base).as_posix()
+                entry_id = hashlib.sha1(rel.encode('utf-8', 'surrogateescape')).hexdigest()[:12]
+                entries.append(PdfEntry(entry_id, p, rel, p.stem, st.st_size))
+            self._by_id = {e.id: e for e in entries}
+            return entries
 
 
 def human_size(n):
@@ -2263,19 +2283,20 @@ def run_server(handler, host, port, no_browser):
     if host in WILDCARD_HOSTS:
         # 0.0.0.0 / :: only means "every network connection"; it is not an address to visit.
         url = f'http://localhost:{port}/'
-        print(f'serving at {url} on this device  (Ctrl+C to stop)')
+        print(f'serving at {url} on this device  (Ctrl+C to stop)', flush=True)
         addresses = lan_addresses()
         for address in addresses:
             shown = f'[{address}]' if ':' in address else address
-            print(f'on your network, open  http://{shown}:{port}/')
+            print(f'on your network, open  http://{shown}:{port}/', flush=True)
         if not addresses:
             print(
                 'on your network, open  http://<this device\'s IP address>:' + str(port) + '/  '
-                "(couldn't work out the address; see your Wi-Fi settings or run `ip a`)"
+                "(couldn't work out the address; see your Wi-Fi settings or run `ip a`)",
+                flush=True,
             )
     else:
         url = f'http://[{host}]:{port}/' if ':' in host else f'http://{host}:{port}/'
-        print(f'serving at {url}  (Ctrl+C to stop)')
+        print(f'serving at {url}  (Ctrl+C to stop)', flush=True)
     if not no_browser:
         try:
             threading.Timer(0.5, lambda: webbrowser.open(url)).start()
@@ -2458,7 +2479,9 @@ def read_config(path):
         text = raw.decode('utf-8-sig')
     except UnicodeDecodeError:
         raise ConfigError('is not UTF-8 text') from None
-    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=('#',))
+    # Both # and ; are accepted as inline comment markers (INI convention). Values that
+    # themselves contain # or ; should put the comment on its own line instead.
+    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=('#', ';'))
     parser.optionxform = lambda key: CONFIG_ALIASES.get(
         key.strip().lower().replace('-', '_'), key.strip().lower().replace('-', '_')
     )
@@ -2829,6 +2852,8 @@ def main():
         sys.exit(f'error: no permission to read {src_path}')
     except (NotImplementedError, UnsupportedContentError) as exc:
         sys.exit(f'error: this EPUB uses a zip feature that is not supported: {exc}')
+    except ResourceTooLargeError as exc:
+        sys.exit(f'error: a required file in this EPUB is too large to open: {exc}')
     except OSError as exc:
         sys.exit(f'error: could not read {src_path}: {exc.strerror or exc}')
     except Exception as exc:
