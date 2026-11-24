@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import io
 import os
+import re
 import posixpath
 import socket
 import subprocess
@@ -79,10 +80,24 @@ def free_port():
         return s.getsockname()[1]
 
 
+_EMPTY_HOME = tempfile.mkdtemp(prefix='epub_server_home_')
+
+
+def isolated_env(**extra):
+    """An environment whose home/config folders are empty, so a real settings file on the
+    machine running the tests can't change the results."""
+    env = dict(os.environ)
+    env.update(
+        HOME=_EMPTY_HOME, XDG_CONFIG_HOME=_EMPTY_HOME, APPDATA=_EMPTY_HOME, USERPROFILE=_EMPTY_HOME
+    )
+    env.update(extra)
+    return env
+
+
 class Cli:
     """The script run as a real subprocess, the way a user would run it."""
 
-    def __init__(self, *args):
+    def __init__(self, *args, env=None):
         self.port = free_port()
         self.proc = subprocess.Popen(
             [
@@ -98,6 +113,7 @@ class Cli:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
+            env=env or isolated_env(),
         )
         for _ in range(100):
             try:
@@ -118,7 +134,7 @@ class Cli:
             return self.proc.communicate()
 
 
-def run_script(*args):
+def run_script(*args, env=None):
     """Run the script expecting it to exit on its own (bad input); returns the process."""
     return subprocess.run(
         [sys.executable, '-I', str(SCRIPT), *map(str, args), '--no-browser'],
@@ -126,6 +142,7 @@ def run_script(*args):
         stderr=subprocess.PIPE,
         universal_newlines=True,
         timeout=30,
+        env=env or isolated_env(),
     )
 
 
@@ -1139,6 +1156,413 @@ class PdfTests(TempDirCase):
 # ---------------------------------------------------------------------------
 
 
+class ConfigFileTests(TempDirCase):
+    def write_config(self, text, name='settings.ini'):
+        path = self.tmp / name
+        path.write_text(text, encoding='utf-8')
+        return path
+
+    def test_every_setting_is_read_and_checked(self):
+        path = self.write_config(
+            '[server]\naccess = share\nport = 9100\nopen_browser = no\nverbose = yes\n'
+            'allow_scripts = on\nallow_remote = false\npath = books/a.epub\n'
+        )
+        found = es.read_config(path)
+        self.assertEqual(
+            found,
+            {
+                'access': 'share',
+                'port': 9100,
+                'open_browser': False,
+                'verbose': True,
+                'allow_scripts': True,
+                'allow_remote': False,
+                'path': str(self.tmp.resolve() / 'books' / 'a.epub'),
+            },
+        )
+
+    def test_keys_are_forgiving_about_case_and_dashes(self):
+        found = es.read_config(
+            self.write_config('[Server]\nAllow-Scripts = YES\naccess = Only_Me\n')
+        )
+        self.assertEqual(found, {'allow_scripts': True, 'access': 'only-me'})
+
+    def test_empty_file_or_only_comments_change_nothing(self):
+        self.assertEqual(es.read_config(self.write_config('')), {})
+        self.assertEqual(es.read_config(self.write_config('# nothing here\n[server]\n')), {})
+
+    def test_the_generated_template_is_valid_and_only_turns_on_auto_apply(self):
+        found = es.read_config(self.write_config(es.CONFIG_TEMPLATE))
+        self.assertEqual(found, {'auto_apply_custom_settings': True})
+        for key in es.CONFIG_KEYS:  # every setting is documented in it
+            self.assertIn(key + ' =', es.CONFIG_TEMPLATE)
+
+    def test_the_auto_apply_setting_has_friendlier_spellings(self):
+        for name in ('auto_apply_custom_settings', 'auto_apply_settings', 'Auto-Apply'):
+            found = es.read_config(self.write_config(f'[server]\n{name} = yes\n'))
+            self.assertEqual(found, {'auto_apply_custom_settings': True}, name)
+
+    def test_mistakes_are_explained_not_ignored(self):
+        cases = {
+            'port = 70000': '"port"',
+            'port = abc': '"port"',
+            'verbose = maybe': 'must be yes or no',
+            'access = everyone': 'must be only-me or share',
+            'hots = 1': 'unknown setting "hots"',
+            'access = share\nhost = 0.0.0.0': 'both "access" and "host"',
+            'host =': '"host" is empty',
+            'path =': '"path" is empty',
+            'port = 1\nport = 2': 'port',
+        }
+        for body, expected in cases.items():
+            path = self.write_config('[server]\n' + body + '\n')
+            with self.assertRaisesRegex(es.ConfigError, expected, msg=body):
+                es.read_config(path)
+        for text, expected in (
+            ('port = 1\n', 'must start with a \\[server\\] line'),
+            ('[other]\nport = 1\n', 'unknown section'),
+            ('[server\n', ''),
+        ):
+            with self.assertRaisesRegex(es.ConfigError, expected, msg=text):
+                es.read_config(self.write_config(text))
+
+    def test_unreadable_binary_or_huge_files_are_rejected(self):
+        (self.tmp / 'bin.ini').write_bytes(b'\xff\xfe\x00\x01\x80')
+        with self.assertRaisesRegex(es.ConfigError, 'not UTF-8'):
+            es.read_config(self.tmp / 'bin.ini')
+        (self.tmp / 'big.ini').write_bytes(b'#' * (es.MAX_CONFIG_BYTES + 10))
+        with self.assertRaisesRegex(es.ConfigError, 'too big'):
+            es.read_config(self.tmp / 'big.ini')
+        with self.assertRaisesRegex(es.ConfigError, 'cannot be read'):
+            es.read_config(self.tmp / 'missing.ini')
+
+    def run_with(self, config_text, *args):
+        config = self.write_config(config_text)
+        epub = write_epub(self.tmp / 'cfg.epub', main_epub_files())
+        cli = Cli(epub, '--config', config, *args)
+        try:
+            cli.get('/')
+        finally:
+            out, err = cli.stop()
+        return cli, out, err
+
+    def test_config_values_become_the_defaults(self):
+        _, out, err = self.run_with('[server]\naccess = share\n')
+        self.assertIn('using settings from', out)
+        self.assertIn('on your network, open', out)
+        self.assertIn('anyone who can reach this machine', err)
+
+    def test_config_can_enable_the_scripts_and_remote_switches_with_the_usual_warnings(self):
+        _, _, err = self.run_with('[server]\nallow_scripts = yes\nallow_remote = yes\n')
+        self.assertIn('scripts inside the book are allowed', err)
+        self.assertIn('https:// sites', err)
+
+    def test_command_line_beats_the_config_file(self):
+        cli, out, err = self.run_with('[server]\naccess = share\n', '--only-me')
+        self.assertNotIn('on your network', out)
+        self.assertIn(f'serving at http://127.0.0.1:{cli.port}/', out)
+        cli, out, err = self.run_with('[server]\nhost = 0.0.0.0\n', '--host', '127.0.0.1')
+        self.assertIn(f'serving at http://127.0.0.1:{cli.port}/', out)
+
+    def test_no_config_also_silences_the_notice_about_a_broken_auto_file(self):
+        env = self.home_with('noconf', '[server]\nport = notanumber\n')
+        status, out, err = self.serve_with_env(env, '--no-config')
+        self.assertEqual(status, 200)
+        self.assertNotIn('ignoring settings file', err)
+
+    def test_broken_config_stops_with_a_clear_message(self):
+        config = self.write_config('[server]\nport = notanumber\n')
+        epub = write_epub(self.tmp / 'broken.epub', main_epub_files())
+        r = run_script(epub, '--config', config)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(f'error: settings file {config}', r.stderr)
+        self.assertIn('"port"', r.stderr)
+        self.assertNotIn('Traceback', r.stderr)
+
+    def test_named_config_file_must_exist(self):
+        epub = write_epub(self.tmp / 'nofile.epub', main_epub_files())
+        r = run_script(epub, '--config', self.tmp / 'nope.ini')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('cannot be read', r.stderr)
+
+    def test_path_can_come_from_the_config_and_is_required_from_somewhere(self):
+        epub = write_epub(self.tmp / 'frompath.epub', main_epub_files())
+        config = self.write_config(f'[server]\npath = {epub.name}\n')
+        cli = Cli('--config', config)
+        try:
+            self.assertEqual(cli.get('/').status, 200)
+        finally:
+            cli.stop()
+        r = run_script('--config', self.write_config('[server]\n', 'empty.ini'))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('path', r.stderr)
+
+    def home_with(self, name, config_text=None):
+        """An isolated environment whose per-user config folder holds `config_text`."""
+        home = self.tmp / name
+        home.mkdir()
+        if config_text is not None:
+            (home / 'epub_server').mkdir()
+            (home / 'epub_server' / 'config.ini').write_text(config_text, encoding='utf-8')
+        return isolated_env(HOME=str(home), XDG_CONFIG_HOME=str(home), APPDATA=str(home))
+
+    def serve_with_env(self, env, *args):
+        epub = write_epub(self.tmp / 'auto.epub', main_epub_files())
+        cli = Cli(epub, *args, env=env)
+        try:
+            status = cli.get('/').status
+        finally:
+            out, err = cli.stop()
+        return status, out, err
+
+    def test_a_valid_file_that_asks_to_auto_apply_is_applied_with_no_arguments_at_all(self):
+        env = self.home_with(
+            'auto1', '[server]\nauto_apply_custom_settings = yes\naccess = share\n'
+        )
+        status, out, err = self.serve_with_env(env)
+        self.assertEqual(status, 200)
+        self.assertIn('(auto-applied)', out)
+        self.assertIn('on your network, open', out)
+
+    def test_a_valid_file_without_auto_apply_is_left_alone(self):
+        for body in (
+            '[server]\naccess = share\n',
+            '[server]\nauto_apply_custom_settings = no\naccess = share\n',
+        ):
+            env = self.home_with('auto2' + str(abs(hash(body))), body)
+            status, out, err = self.serve_with_env(env)
+            self.assertEqual(status, 200)
+            self.assertNotIn('using settings from', out)
+            self.assertNotIn('on your network', out)
+            self.assertNotIn('ignoring settings file', err)  # skipped quietly: nothing is wrong
+
+    def test_a_missing_file_is_skipped(self):
+        status, out, err = self.serve_with_env(self.home_with('auto3'))
+        self.assertEqual(status, 200)
+        self.assertNotIn('using settings from', out)
+        self.assertNotIn('ignoring settings file', err)
+
+    def test_a_corrupted_file_is_skipped_with_a_one_line_notice(self):
+        for body in (
+            '[server]\nauto_apply_custom_settings = yes\nport = notanumber\n',
+            'garbage {{{',
+            '[server\n',
+        ):
+            env = self.home_with('auto4' + str(abs(hash(body))), body)
+            status, out, err = self.serve_with_env(env)
+            self.assertEqual(status, 200, body)  # the server still runs, on built-in defaults
+            self.assertIn('ignoring settings file', err, body)
+            self.assertNotIn('using settings from', out)
+            self.assertNotIn('Traceback', err)
+
+    def test_a_binary_or_unreadable_file_is_skipped_too(self):
+        env = self.home_with('auto5', '[server]\n')
+        (self.tmp / 'auto5' / 'epub_server' / 'config.ini').write_bytes(b'\xff\xfe\x00\x80')
+        status, out, err = self.serve_with_env(env)
+        self.assertEqual(status, 200)
+        self.assertIn('ignoring settings file', err)
+
+    def test_running_with_no_arguments_opens_the_path_from_the_settings(self):
+        epub = write_epub(self.tmp / 'mybook.epub', main_epub_files())
+        env = self.home_with(
+            'auto6', f'[server]\nauto_apply_custom_settings = yes\npath = {epub}\nverbose = yes\n'
+        )
+        cli = Cli(env=env)  # no path, no options
+        try:
+            index = cli.get('/')
+            cli.get('/book/OEBPS/nope.css')
+        finally:
+            out, err = cli.stop()
+        self.assertEqual(index.status, 200)
+        self.assertIn(b'Test Book', index.body)
+        self.assertIn('GET /\n', err)  # verbose came from the file too
+
+    def test_without_a_usable_path_anywhere_the_error_says_how_to_fix_it(self):
+        env = self.home_with('auto7', '[server]\nauto_apply_custom_settings = yes\n')
+        r = run_script(env=env)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('path', r.stderr)
+        self.assertIn('settings file', r.stderr)
+
+    def test_command_line_still_beats_an_auto_applied_file(self):
+        env = self.home_with(
+            'auto8', '[server]\nauto_apply_custom_settings = yes\naccess = share\n'
+        )
+        cli_status, out, err = self.serve_with_env(env, '--only-me')
+        self.assertNotIn('on your network', out)
+
+    def test_no_config_turns_auto_apply_off_for_one_run(self):
+        env = self.home_with(
+            'auto9', '[server]\nauto_apply_custom_settings = yes\naccess = share\n'
+        )
+        status, out, err = self.serve_with_env(env, '--no-config')
+        self.assertNotIn('using settings from', out)
+        self.assertNotIn('on your network', out)
+
+    def test_an_explicit_config_is_applied_even_without_auto_apply_but_errors_are_loud(self):
+        config = self.write_config('[server]\naccess = share\n', 'named.ini')
+        epub = write_epub(self.tmp / 'named.epub', main_epub_files())
+        cli = Cli(epub, '--config', config)
+        try:
+            cli.get('/')
+        finally:
+            out, err = cli.stop()
+        self.assertIn('on your network, open', out)
+        self.assertNotIn('(auto-applied)', out)
+
+    def test_a_file_in_the_current_folder_is_never_used(self):
+        stray = self.tmp / 'cwd'
+        stray.mkdir()
+        (stray / es.CONFIG_FILE_NAME).write_text(
+            '[server]\nauto_apply_custom_settings = yes\naccess = share\n'
+        )
+        epub = write_epub(self.tmp / 'cwdbook.epub', main_epub_files())
+        r = subprocess.run(
+            [sys.executable, '-I', str(SCRIPT), str(epub), '--no-browser', '--help'],
+            cwd=stray,
+            env=isolated_env(),
+            stdout=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        self.assertEqual(r.returncode, 0)
+        status, out, err = self.serve_with_env(self.home_with('auto10'))
+        self.assertNotIn('using settings from', out)
+        self.assertEqual(es.user_config_path().name, 'config.ini')
+
+    def test_init_config_writes_a_template_once(self):
+        target = self.tmp / 'new' / 'dir' / 'conf.ini'
+        r = run_script('--init-config', '--config', target)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('wrote', r.stdout)
+        self.assertEqual(target.read_text(encoding='utf-8'), es.CONFIG_TEMPLATE)
+        again = run_script('--init-config', '--config', target)
+        self.assertNotEqual(again.returncode, 0)
+        self.assertIn('already exists', again.stderr)
+        self.assertEqual(target.read_text(encoding='utf-8'), es.CONFIG_TEMPLATE)
+
+    def test_a_failed_write_leaves_no_half_written_file(self):
+        target = self.tmp / 'atomic' / 'conf.ini'
+        with mock.patch.object(es.os, 'fsync', side_effect=OSError(28, 'No space left on device')):
+            result = es.init_config(target)
+        self.assertIn('could not write', result)
+        self.assertIn('No space left', result)
+        self.assertFalse(target.exists())
+        self.assertEqual(list(target.parent.iterdir()), [])  # the temporary file is cleaned up
+
+    def test_an_existing_file_is_never_touched_by_init_config(self):
+        target = self.tmp / 'precious.ini'
+        target.write_text('[server]\nport = 1234\n')
+        self.assertIn('already exists', es.init_config(target))
+        self.assertEqual(target.read_text(), '[server]\nport = 1234\n')
+        self.assertEqual([p.name for p in self.tmp.iterdir() if p.name.startswith('.epub')], [])
+
+    def test_init_config_still_works_where_hard_links_are_unavailable(self):
+        target = self.tmp / 'nolink.ini'
+        with mock.patch.object(es.os, 'link', side_effect=OSError(1, 'Operation not permitted')):
+            self.assertEqual(es.init_config(target), 0)
+        self.assertEqual(target.read_text(encoding='utf-8'), es.CONFIG_TEMPLATE)
+        self.assertEqual(
+            sorted(p.name for p in self.tmp.iterdir() if p.name.startswith('.epub')), []
+        )
+
+    def test_check_config_reports_valid_corrupted_and_missing(self):
+        good = self.write_config(
+            '[server]\nauto_apply_custom_settings = yes\nport = 9000\n', 'g.ini'
+        )
+        quiet = self.write_config('[server]\nport = 9000\n', 'q.ini')
+        bad = self.write_config('[server]\nport = nine\n', 'b.ini')
+        r = run_script('--check-config', '--config', good)
+        self.assertEqual((r.returncode, 'applied automatically' in r.stdout), (0, True))
+        r = run_script('--check-config', '--config', quiet)
+        self.assertEqual((r.returncode, 'only used with --config' in r.stdout), (0, True))
+        r = run_script('--check-config', '--config', bad)
+        self.assertEqual(
+            (r.returncode, 'CORRUPTED' in r.stdout, 'skipped' in r.stdout), (1, True, True)
+        )
+        r = run_script('--check-config', '--config', self.tmp / 'gone.ini')
+        self.assertEqual((r.returncode, 'not found' in r.stdout), (1, True))
+        self.assertNotIn('Traceback', r.stderr)
+
+    def test_check_config_without_a_name_looks_where_the_script_would(self):
+        env = self.home_with('chk', '[server]\nauto_apply_custom_settings = yes\nport = 9000\n')
+        r = run_script('--check-config', env=env)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('applied automatically', r.stdout)
+        env = self.home_with('chk2', '[server]\nport = nine\n')
+        r = run_script('--check-config', env=env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('CORRUPTED', r.stdout)
+        r = run_script('--check-config', env=self.home_with('chk3'))
+        self.assertEqual(r.returncode, 0)
+        self.assertIn('not found', r.stdout)
+
+    def pdf_cli(self, *args, env=None):
+        root = self.tmp / 'pdfcli'
+        root.mkdir(exist_ok=True)
+        (root / 'a.pdf').write_bytes(b'%PDF-1.4 a')
+        cli = Cli(root / 'a.pdf', *args, env=env)
+        try:
+            page = cli.get('/').body.decode()
+        finally:
+            out, err = cli.stop()
+        return page, out
+
+    def test_pdfjs_is_on_by_default_and_the_command_line_can_turn_it_off(self):
+        page, out = self.pdf_cli()
+        self.assertIn('cdnjs.cloudflare.com', page)
+        self.assertIn('PDF.js fallback is on', out)
+        page, out = self.pdf_cli('--no-pdfjs')
+        self.assertNotIn('cdnjs', page)
+        self.assertNotIn('<script', page)
+        self.assertNotIn('PDF.js fallback is on', out)
+
+    def test_pdfjs_mode_and_version_on_the_command_line(self):
+        page, out = self.pdf_cli('--pdfjs', 'legacy')
+        self.assertIn('data-pdfjs-mode="legacy"', page)
+        self.assertIn('3.11.174 only', out)
+        page, out = self.pdf_cli('--pdfjs', 'latest', '--pdfjs-latest-version', '6.0.1')
+        self.assertIn('data-pdfjs-mode="latest"', page)
+        self.assertIn('data-pdfjs-latest="6.0.1"', page)
+        page, out = self.pdf_cli('--pdfjs', 'off')
+        self.assertNotIn('cdnjs', page)
+        for bad in (('--pdfjs-latest-version', '1/../x'), ('--pdfjs', 'bogus')):
+            self.assertEqual(run_script(*bad, self.tmp).returncode, 2)
+
+    def test_pdfjs_setting_in_the_config_file(self):
+        self.assertEqual(
+            es.read_config(self.write_config('[server]\npdfjs = no\n')), {'pdfjs': 'off'}
+        )
+        for text, mode in (('yes', 'auto'), ('Legacy', 'legacy'), ('latest', 'latest')):
+            config = self.write_config(f'[server]\npdfjs = {text}\n', 'm.ini')
+            self.assertEqual(es.read_config(config), {'pdfjs': mode})
+        config = self.write_config('[server]\npdfjs_latest_version = 6.6.1\n', 'v.ini')
+        self.assertEqual(es.read_config(config), {'pdfjs_latest_version': '6.6.1'})
+        with self.assertRaisesRegex(es.ConfigError, 'pdfjs_latest_version'):
+            es.read_config(self.write_config('[server]\npdfjs_latest_version = 1/../x\n', 'w.ini'))
+        with self.assertRaisesRegex(es.ConfigError, 'pdfjs'):
+            es.read_config(self.write_config('[server]\npdfjs = sometimes\n', 'bad.ini'))
+        config = self.write_config('[server]\npdfjs = no\n', 'off.ini')
+        page, out = self.pdf_cli('--config', config)
+        self.assertNotIn('cdnjs', page)
+        env = self.home_with('pdfauto', '[server]\nauto_apply_custom_settings = yes\npdfjs = no\n')
+        page, out = self.pdf_cli(env=env)
+        self.assertNotIn('cdnjs', page)
+        self.assertIn('(auto-applied)', out)
+
+    def test_init_config_defaults_to_the_per_user_location(self):
+        home = self.tmp / 'home2'
+        env = isolated_env(
+            HOME=str(home), XDG_CONFIG_HOME=str(home / 'cfg'), APPDATA=str(home / 'cfg')
+        )
+        r = run_script('--init-config', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((home / 'cfg' / 'epub_server' / 'config.ini').is_file())
+
+    def test_config_and_no_config_conflict(self):
+        r = run_script('--config', 'x.ini', '--no-config', 'a.epub')
+        self.assertEqual(r.returncode, 2)
+
+
 class BrowserCompatibilityTests(TempDirCase):
     CHROME = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36'
     AGENTS = {
@@ -1208,10 +1632,27 @@ class BrowserCompatibilityTests(TempDirCase):
         for name in ('iphone', 'android_chrome', 'ios_chrome'):
             self.assertIsNone(self.notice(name, False), name)
             note = self.notice(name, True)
-            self.assertIn('often cannot show a PDF inside a page', note, name)
-            self.assertIn('Open in new tab', note)
+            self.assertIn('often have no native PDF viewer', note, name)
+            self.assertIn('PDF.js viewer', note)
+            off = es.assess_browser(self.AGENTS[name], True, pdfjs=False)
+            self.assertIn('often cannot show a PDF', off, name)
+            self.assertIn('Open in new tab', off)
+            self.assertNotIn('use the "PDF.js viewer" button', off)
         self.assertIsNone(self.notice('modern_chrome', True))
         self.assertIn('no built-in PDF viewer', self.notice('ie11', True))
+        self.assertIn('PDF.js viewer', self.notice('ie11', True))
+        self.assertNotIn('PDF.js', es.assess_browser(self.AGENTS['ie11'], True, pdfjs=False))
+
+    def test_smart_tv_browsers_are_told_about_the_pdf_fallback(self):
+        for ua in (
+            'Mozilla/5.0 (Linux; VIDAA 6.0; Hisense) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.85 Safari/537.36 VIDAA/6.0',
+            'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.5) AppleWebKit/537.36 (KHTML, like Gecko) 85.0.4183.93/6.5 TV Safari/537.36',
+            'Mozilla/5.0 (Web0S; Linux/SmartTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.128 Safari/537.36 WebAppManager',
+        ):
+            note = es.assess_browser(ua, True)
+            self.assertIn('smart-TV', note, ua)
+            self.assertIn('PDF.js', note, ua)
+            self.assertIsNone(es.assess_browser(ua, False), ua)  # EPUB pages are plain HTML
 
     def test_the_banner_never_repeats_the_user_agent_and_is_escaped(self):
         evil = 'Mozilla/5.0 <script>alert(1)</script> Chrome/5.0 evil.example'
@@ -1280,13 +1721,47 @@ class BrowserCompatibilityTests(TempDirCase):
             pages = ['/'] if single else ['/', '/view/' + library.scan()[0].id]
             for page in pages:
                 phone = srv.get(page, {'User-Agent': self.AGENTS['android_chrome']})
-                self.assertIn(b'often cannot show a PDF', phone.body, page)
-                self.assertIn(b'Open in new tab', phone.body, page)
+                self.assertIn(b'often', phone.body, page)
+                self.assertIn(b'PDF.js viewer', phone.body, page)
                 self.assertEqual(phone.headers['vary'], 'User-Agent')
                 ie = srv.get(page, {'User-Agent': self.AGENTS['ie11']})
                 self.assertIn(b'no built-in PDF viewer', ie.body, page)
                 desktop = srv.get(page, {'User-Agent': self.AGENTS['modern_chrome']})
                 self.assertNotIn(b'class="compat"', desktop.body, page)
+
+    def test_viewer_page_has_the_pdfjs_fallback_pinned_and_hardened(self):
+        srv, library = self.serve_pdfs(True)
+        page = srv.get('/').body.decode()
+        entry = library.scan()[0]
+        self.assertIn(f'data-pdf-url="/pdf/{entry.id}"', page)
+        for part in ('id="btn-pdfjs"', 'id="pdfjs-wrap"', 'id="pdfjs-scroll"', '<object data='):
+            self.assertIn(part, page)
+        # the only other site it can contact, at a fixed version
+        self.assertIn('data-pdfjs-legacy="3.11.174"', page)
+        self.assertIn(f'data-pdfjs-latest="{es.PDFJS_LATEST_VERSION}"', page)
+        self.assertIn('data-pdfjs-mode="auto"', page)
+        self.assertEqual(
+            set(re.findall(r'https://[a-z0-9.-]+', page)), {'https://cdnjs.cloudflare.com'}
+        )
+        # CVE-2024-4367: a crafted PDF must not be able to run script in this page
+        self.assertIn('isEvalSupported: false', page)
+        self.assertIn('withCredentials: false', page)
+        self.assertEqual(es.PDFJS_LEGACY_VERSION, '3.11.174')
+
+    def test_turning_pdfjs_off_removes_every_trace_of_it(self):
+        root = self.tmp / 'nopdfjs'
+        root.mkdir()
+        (root / 'a.pdf').write_bytes(b'%PDF-1.4 a')
+        library = es.PdfLibrary(root / 'a.pdf')
+        srv = Running(quiet_handler(es.PdfHandler, library=library, pdfjs=False))
+        self.addCleanup(srv.close)
+        for ua in (self.AGENTS['android_chrome'], self.AGENTS['modern_chrome']):
+            page = srv.get('/', {'User-Agent': ua}).body.decode()
+            self.assertNotIn('<script', page)
+            self.assertNotIn('cdnjs', page)
+            self.assertNotIn('pdfjs', page.lower())
+            self.assertIn('<object data=', page)
+            self.assertIn('Download', page)
 
     def test_pdf_files_themselves_are_unaffected_by_the_user_agent(self):
         srv, library = self.serve_pdfs(False)
@@ -1447,6 +1922,37 @@ class CompatibilityTests(TempDirCase):
             self.assertNotEqual(r.returncode, 0, host)
             self.assertIn(expected, r.stderr, host)
             self.assertNotIn('Traceback', r.stderr, host)
+
+    def test_share_means_any_device_and_only_me_means_this_device(self):
+        epub = write_epub(self.tmp / 'who.epub', main_epub_files())
+        cli = Cli(epub, '--share')
+        try:
+            cli.get('/')
+        finally:
+            out, err = cli.stop()
+        self.assertIn('on your network, open', out)
+        self.assertIn('anyone who can reach this machine', err)
+        for flags in ((), ('--only-me',)):
+            cli = Cli(epub, *flags)
+            try:
+                cli.get('/')
+            finally:
+                out, err = cli.stop()
+            self.assertIn(f'serving at http://127.0.0.1:{cli.port}/', out, flags)
+            self.assertNotIn('on your network', out, flags)
+            self.assertNotIn('anyone who can reach', err, flags)
+
+    def test_share_only_me_and_host_cannot_be_combined(self):
+        epub = write_epub(self.tmp / 'combo.epub', main_epub_files())
+        for flags in (
+            ('--share', '--only-me'),
+            ('--share', '--host', '127.0.0.1'),
+            ('--only-me', '--host', '0.0.0.0'),
+        ):
+            r = run_script(str(epub), *flags)
+            self.assertEqual(r.returncode, 2, flags)
+            self.assertNotIn('Traceback', r.stderr)
+            self.assertRegex(r.stderr, 'not allowed with|cannot be combined')
 
     def test_wildcard_host_prints_usable_links_not_0_0_0_0(self):
         epub = write_epub(self.tmp / 'lan.epub', main_epub_files())

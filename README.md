@@ -12,7 +12,9 @@ single `.pdf`, or a whole folder of them.
   disk with HTTP Range support, so large files open quickly and the browser
   can jump to any page without downloading the whole thing first. The folder is
   rescanned on every page load, so PDFs you add while the server is running
-  appear on reload. See [Hosting PDFs](#hosting-pdfs).
+  appear on reload. When the browser has no native PDF plugin (or it has been
+  stripped), a **PDF.js** fallback viewer is one click away. See
+  [Hosting PDFs](#hosting-pdfs).
 
 - **Zero dependencies** — standard library only, works anywhere Python 3
   runs, including Termux on Android.
@@ -81,16 +83,30 @@ single `.pdf`, or a whole folder of them.
   IPv6 addresses such as `--host ::1` are supported. Non-ASCII titles never
   crash a console that can't display them.
 
+- **PDFs on smart TVs and other browsers with no PDF viewer** — many TV
+  browsers (VIDAA/Hisense, Tizen, webOS...) and locked-down WebViews cannot open
+  PDFs and have no download button. When the viewer page detects that, it
+  switches by itself to [PDF.js](https://mozilla.github.io/pdf.js/) (page
+  by page, with Prev/Next, arrow keys and zoom); a "PDF.js viewer" button lets
+  you switch by hand anywhere. PDF.js is loaded from `cdnjs.cloudflare.com`
+  **only** in that case, so the device needs internet access. By default
+  (`--pdfjs auto`) it tries the newest release (6.5.438) and, if that fails to
+  load or open the file on this device, automatically falls back to the old
+  3.11.174 (the last release that runs as a plain script on old TV browsers),
+  and remembers the failure in the browser so it doesn't retry every time; the PDF itself is still read from this server. It runs with
+  `isEvalSupported: false`, Mozilla's mitigation for CVE-2024-4367 (a crafted
+  PDF running script in the page). Use `--pdfjs off` (or `--no-pdfjs`, or `pdfjs = no` in the
+  settings file) to never load anything from another site.
 - **Browser heads-up** — if your browser looks too old (older than Chrome/Edge
   84, Firefox 78, Safari/iOS 14, Opera 70, Samsung Internet 14; any Internet
   Explorer or pre-2020 Edge), or isn't one it recognises, the contents page
   shows a yellow note that things may not work but you can keep going.
   PDF pages also warn phones and tablets, which often can't show a PDF inside
-  a page, and point to "Open in new tab" / "Download". The warning only
-  advises: pages are always served in full. Scripts and tools such as `curl`,
-  and requests with no User-Agent, are never warned. The browser is guessed
-  from its User-Agent, which can be wrong; the page is marked `Vary:
-  User-Agent`, and chapters themselves are never changed.
+  a page, and point to "PDF.js viewer" / "Open in new tab" / "Download". The
+  warning only advises: pages are always served in full. Scripts and tools
+  such as `curl`, and requests with no User-Agent, are never warned. The
+  browser is guessed from its User-Agent, which can be wrong; the page is
+  marked `Vary: User-Agent`, and chapters themselves are never changed.
 
 ## Requirements
 
@@ -110,12 +126,90 @@ This starts a local server and opens your browser to it automatically.
 | Option         | Default       | Description                                              |
 |----------------|---------------|-----------------------------------------------------------|
 | `path`         | *(required)*  | An `.epub` or `.pdf` file, or a folder: either already-extracted epub contents or a folder of PDFs to host |
-| `--port PORT`  | `8000`        | Port to serve on                                          |
-| `--host HOST`  | `127.0.0.1`   | Host/interface to bind to                                  |
+| `--only-me`    | *(default)*   | Only this device can open it                              |
+| `--share`      | off           | Any device on the same Wi-Fi/network can open it (no password: trusted networks only) |
+| `--port PORT`  | `8000`        | Port to serve on (1-65535)                                |
+| `--host ADDRESS` | `127.0.0.1` | Advanced: the exact address to listen on, instead of `--only-me`/`--share` |
 | `--no-browser` | off           | Don't automatically open a browser tab                    |
 | `--verbose`    | off           | Log every request (failed requests are always logged)     |
+| `--pdfjs MODE` | auto          | PDF.js fallback: `auto` (newest, old 3.11.174 as backup), `latest` (newest only), `legacy` (old only), `off` |
+| `--no-pdfjs`   | off           | Same as `--pdfjs off` (nothing is loaded from other sites) |
+| `--pdfjs-latest-version X.Y.Z` | 6.5.438 | Which release "latest" means |
+| `--config FILE` | see below    | Read default settings from this file (see [Settings file](#settings-file-run-it-with-no-arguments)) |
+| `--no-config`  | off           | Ignore any settings file this time                        |
+| `--init-config` |              | Write a commented settings file and exit                  |
 | `--allow-scripts` | off        | Let JavaScript inside the book run (blocked by default)   |
 | `--allow-remote`  | off        | Let the book load images/styles/etc. from `https://` sites (blocked by default) |
+
+### Settings file (run it with no arguments)
+
+Put your usual choices in a settings file and the script uses them by itself:
+`python3 epub_server.py` (or `uv run epub_server.py`) with nothing typed will
+open the book you want, shared the way you want.
+
+1. Create a commented starter file:
+   ```
+   python3 epub_server.py --init-config
+   ```
+   It is written to `~/.config/epub_server/config.ini` (on Windows,
+   `%APPDATA%\epub_server\config.ini`) and never overwrites an existing file.
+   Use `--init-config --config my.ini` to write it somewhere else.
+2. Edit it. For example:
+   ```ini
+   [server]
+   auto_apply_custom_settings = yes   ; apply this file automatically
+   access = share                     ; or: only-me
+   port = 9000
+   open_browser = no
+   path = ~/Books/my-book.epub        ; served when no path is typed
+   ```
+3. Run `python3 epub_server.py`. It prints `using settings from ... (auto-applied)`.
+
+Every command-line option has a setting:
+
+| Setting | Values | Same as |
+|---|---|---|
+| `auto_apply_custom_settings` | yes / no (also spelled `auto_apply_settings`) | whether a file found automatically is used at all (see below) |
+| `access` | `only-me` or `share` | `--only-me` / `--share` |
+| `host` | an address, e.g. `127.0.0.1` | `--host` (use `access` *or* `host`, not both) |
+| `port` | 1-65535 | `--port` |
+| `open_browser` | yes / no | `--no-browser` when `no` |
+| `verbose` | yes / no | `--verbose` |
+| `allow_scripts` | yes / no | `--allow-scripts` |
+| `allow_remote` | yes / no | `--allow-remote` |
+| `pdfjs` | auto / latest / legacy / off (yes = auto, no = off) | `--pdfjs` |
+| `pdfjs_latest_version` | a version like 6.5.438 | `--pdfjs-latest-version` |
+| `path` | a book, PDF or folder | the `path` argument |
+
+`--config`, `--no-config`, `--init-config` and `--help` are about the file
+itself, so they have no setting.
+
+**Which file, and when it applies**
+
+- **Automatic file.** Without `--config`, the script looks for `epub_server.ini`
+  next to `epub_server.py`, then the per-user file above (the first one that
+  exists). It is applied only if it is valid **and** has
+  `auto_apply_custom_settings = yes`. If it is missing, it is skipped. If it is
+  corrupted (bad value, unknown setting, not text...), it is skipped with a
+  one-line `ignoring settings file ...` notice and the server runs on the
+  built-in defaults. If it is valid but doesn't ask to be applied, it is left
+  alone silently.
+- **A file you name.** `--config FILE` is always applied, whether or not it
+  has `auto_apply_custom_settings`, and a problem in it is an error, since you
+  asked for that file specifically.
+- **Never the current folder.** The folder you run from is not searched, so a
+  stray file in a downloaded folder can't change how the server behaves.
+- `--no-config` ignores every settings file for that run.
+- **Order of priority:** command-line options, then the settings file, then the
+  built-in defaults. `--share`, `--only-me` or `--host` on the command line
+  replaces the file's `access`/`host`; a path typed on the command line
+  replaces the file's `path`.
+- Setting names ignore case and `-` vs `_`. A command-line flag can switch
+  things on but not off, so for one run without a file's `allow_scripts = yes`
+  use `--no-config`.
+- Turning on `allow_scripts`, `allow_remote` or `access = share` in the file
+  prints the same safety warnings as the matching command-line options.
+- A relative `path` is relative to the settings file's folder; `~` is your home.
 
 ### Examples
 
@@ -143,10 +237,10 @@ python epub_server.py ./my-extracted-book/
 Allow other devices on your network to connect (e.g. read on your phone
 while it runs on your laptop) — only do this on networks you trust:
 ```
-python epub_server.py my-book.epub --host 0.0.0.0
+python epub_server.py my-book.epub --share
 ```
 
-When you use `--host 0.0.0.0`, the terminal prints the links to use:
+When you use `--share` (or `--host 0.0.0.0`), the terminal prints the links to use:
 `serving at http://localhost:8000/ on this device` and one
 `on your network, open http://192.168.x.x:8000/` line per local address
 (`0.0.0.0` itself is not an address you can visit). In Termux, open those
@@ -170,7 +264,7 @@ python epub_server.py ./my-pdfs/
 Share a PDF library with other devices on your network (only on networks you
 trust — anyone who can reach the port can read every PDF in the folder):
 ```
-python epub_server.py ./my-pdfs/ --host 0.0.0.0 --no-browser
+python epub_server.py ./my-pdfs/ --share --no-browser
 ```
 
 How the path is interpreted:
@@ -189,9 +283,19 @@ Pages: `/` is the library (or the viewer, when you pointed at one file),
 inside the library, and only files found by the scan can be requested — a URL
 can't be used to reach anything else on disk.
 
-The viewer uses your browser's built-in PDF support. Some mobile browsers
-(Android Chrome, for example) don't show PDFs inline; there, use the "Open in
-new tab" or "Download" links in the viewer's top bar.
+The viewer uses your browser's built-in PDF support first. When that is
+missing or stripped — common on phones, locked-down Chromium WebViews, and
+especially **smart-TV browsers such as VIDAA OS (Hisense / Toshiba)** whose
+Chromium ("Odin") build has no PDF plugin and no useful download UI — the
+page **automatically switches to the PDF.js viewer**. You can also click
+**PDF.js viewer** in the top bar. That loads Mozilla's PDF.js from a CDN and
+renders the file client-side; the PDF itself is still fetched from this
+server (same origin), so it works even when the browser's native viewer and
+"Save as…" are disabled. It needs a network connection only for the PDF.js
+library; after that the document is local. Start with `--pdfjs off` (or set
+`pdfjs = off`) to turn the fallback off so nothing is loaded from other sites. You
+can switch back to the native viewer with the button that appears. "Open in new tab" and "Download" remain
+available when the environment allows them.
 
 ### Troubleshooting
 
@@ -268,8 +372,11 @@ Standard library only; the suite starts real servers on free local ports.
   pages, so it may overlap content on some of them.
 - **Mix EPUBs and PDFs in one library** — a run serves either one EPUB or
   PDFs, not both. Folder mode only picks up PDFs.
-- **PDF extras** — no text search, thumbnails, or reading-progress tracking;
-  the viewer is whatever your browser provides. Password-protected PDFs are
-  served as-is, and your browser's viewer will prompt for the password.
+- **PDF extras** — no text search, thumbnails, or reading-progress tracking.
+  The primary viewer is the browser's built-in one; a PDF.js fallback (loaded
+  from a CDN) is available when the native plugin is missing or stripped.
+  Password-protected PDFs are served as-is (native viewer will prompt;
+  PDF.js currently does not unlock them). On a TV, the fallback needs the TV to
+  reach `cdnjs.cloudflare.com`; if it can't, the page says so.
 - It's read-only — nothing is ever extracted or written to disk; the epub
   (or PDF) is served directly from the file or folder you pointed it at.

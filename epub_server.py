@@ -45,6 +45,7 @@ if sys.version_info < (3, 7):  # checked before anything newer than 3.6 is impor
     )
 
 import argparse
+import configparser
 import errno
 import hashlib
 import html
@@ -54,6 +55,7 @@ import os
 import posixpath
 import re
 import stat
+import tempfile
 import threading
 import traceback
 import unicodedata
@@ -1108,10 +1110,15 @@ _BROWSER_TOKENS = (
     ('CriOS/', 'Chrome', r'CriOS/(\d+)'),
     ('Safari/', 'Safari', r'Version/(\d+)'),
 )
-_PDF_INLINE_TROUBLE_RE = re.compile(r'Android|iPhone|iPad|iPod|Mobile|Silk|Kindle', re.IGNORECASE)
+# Phones/tablets + smart-TV engines (VIDAA/Hisense "Odin", many other TV browsers)
+# that usually ship without a usable native PDF plugin.
+_PDF_INLINE_TROUBLE_RE = re.compile(
+    r'Android|iPhone|iPad|iPod|Mobile|Silk|Kindle|VIDAA|SmartTV|Hisense|Odin/|Web0S|Tizen|WebOS',
+    re.IGNORECASE,
+)
 
 
-def assess_browser(user_agent, for_pdf=False):
+def assess_browser(user_agent, for_pdf=False, pdfjs=True):
     """A short heads-up for browsers this reader may not work well in, or None.
 
     A User-Agent can be wrong or missing, so this only ever *advises*: the page is
@@ -1158,12 +1165,24 @@ def assess_browser(user_agent, for_pdf=False):
                 else 'This looks like an unusual or text-mode browser'
             )
     if for_pdf and _PDF_INLINE_TROUBLE_RE.search(ua):
-        notes.append(
-            'phones and tablets often cannot show a PDF inside a page (some show only the '
-            'first page) - if it looks wrong, use "Open in new tab" or "Download"'
-        )
+        if pdfjs:
+            notes.append(
+                'phones, tablets and many smart-TV browsers (including VIDAA / Hisense) often '
+                'have no native PDF viewer - the page should switch to the PDF.js viewer '
+                'automatically; if not, use the "PDF.js viewer" button'
+            )
+        else:
+            notes.append(
+                'phones, tablets and smart TVs often cannot show a PDF inside a page - if it '
+                'looks wrong, use "Open in new tab" or "Download" (the PDF.js viewer is switched '
+                'off on this server)'
+            )
     if for_pdf and ('MSIE ' in ua or 'Trident/' in ua):
-        notes.append('it has no built-in PDF viewer, so use "Download"')
+        notes.append(
+            'it has no built-in PDF viewer - try "PDF.js viewer" or "Download"'
+            if pdfjs
+            else 'it has no built-in PDF viewer, so use "Download"'
+        )
     if not notes:
         return None
     text = '; '.join(notes)
@@ -1322,12 +1341,21 @@ def printable(text, limit=200):
     return shown + ('...' if len(text) > limit else '')
 
 
+PDFJS_LATEST_VERSION = '6.5.438'
+PDFJS_LEGACY_VERSION = '3.11.174'
+PDFJS_MODES = ('auto', 'latest', 'legacy', 'off')
+_PDFJS_VERSION_RE = re.compile(r'\d{1,3}\.\d{1,3}\.\d{1,4}')
+
+
 class ReaderHandler(BaseHTTPRequestHandler):
     book = None
     verbose = False
     csp = None  # Content-Security-Policy to send with every response, if set
     chapter_cache = None  # ByteLRU of processed chapters, if set
     for_pdf = False  # whether entry pages host PDFs (changes the browser heads-up)
+    pdfjs = True  # whether the PDF viewer may fall back to PDF.js (loaded from a CDN)
+    pdfjs_mode = 'auto'  # auto / latest / legacy (which PDF.js version(s) to try)
+    pdfjs_latest = PDFJS_LATEST_VERSION
     allowed_hosts = None  # accepted Host header names (DNS-rebinding defence), if set
     timeout = 60  # seconds a client may stall on the socket before its connection is dropped
     security_headers = {
@@ -1513,7 +1541,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
     def _send_entry_page(self, make_html):
         """Send an entry page (contents, PDF library or viewer). It may carry a browser
         heads-up, so it varies with the User-Agent and caches are told so."""
-        notice = assess_browser(self.headers.get('User-Agent'), for_pdf=self.for_pdf)
+        notice = assess_browser(self.headers.get('User-Agent'), self.for_pdf, self.pdfjs)
         self._send(
             200,
             make_html(notice).encode(),
@@ -1600,14 +1628,300 @@ PDF_CSS = (
     'display:flex;flex-direction:column}'
     '#bar{background:#222;color:#eee;font-size:14px;padding:8px 14px;display:flex;'
     'flex-wrap:wrap;gap:8px 16px;align-items:center}'
-    '#bar a{color:#9cf;text-decoration:none;white-space:nowrap}'
-    '#bar a:hover{text-decoration:underline}'
+    '#bar a,#bar button{color:#9cf;text-decoration:none;white-space:nowrap;'
+    'background:none;border:0;padding:0;font:inherit;cursor:pointer}'
+    '#bar a:hover,#bar button:hover{text-decoration:underline}'
     '#bar .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:0 1 auto}'
     '#bar .sp{flex:1 1 auto}'
     'body.viewer .compat{margin:0;border-radius:0;border-width:0 0 1px}'
-    'object{flex:1 1 auto;width:100%;border:0}'
+    'object,#native-wrap{flex:1 1 auto;width:100%;border:0;min-height:0}'
     'object p{padding:16px}'
 )
+
+# Only sent with the PDF.js fallback viewer, so a server run with --no-pdfjs has none of it.
+PDFJS_CSS = (
+    '#pdfjs-wrap{display:none;flex:1 1 auto;flex-direction:column;min-height:0;'
+    'background:#525659}'
+    '#pdfjs-wrap.active{display:flex}'
+    '#pdfjs-toolbar{background:#323639;color:#eee;font-size:13px;padding:6px 12px;'
+    'display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center}'
+    '#pdfjs-toolbar button{background:#4a4d50;color:#eee;border:0;border-radius:3px;'
+    'padding:4px 10px;cursor:pointer;font:inherit}'
+    '#pdfjs-toolbar button:hover{background:#5c5f63}'
+    '#pdfjs-toolbar button:disabled{opacity:.4;cursor:default}'
+    '#pdfjs-toolbar .pg{min-width:4.5em;text-align:center}'
+    '#pdfjs-scroll{flex:1 1 auto;overflow:auto;text-align:center;padding:12px}'
+    '#pdfjs-scroll canvas{display:block;margin:0 auto 12px;box-shadow:0 2px 8px rgba(0,0,0,.4)}'
+    '#pdfjs-status{color:#ccc;padding:24px;font:14px sans-serif}'
+    '#pdfjs-status.error{color:#f88}'
+)
+
+# Mozilla PDF.js, loaded from a CDN, only when the browser has no PDF viewer of its own (or
+# the "PDF.js viewer" button is pressed). The PDF itself is still fetched from this server.
+# Two pinned versions: the newest, which is the one that gets security fixes, and an old
+# classic-script release (3.11.x) that still runs on very old engines such as smart TVs and
+# so serves as the backup if the newest does not load, open or draw the file.
+
+PDFJS_VIEWER_SCRIPT = r'''
+(function () {
+  var body = document.body;
+  var pdfUrl = body.getAttribute('data-pdf-url');
+  var mode = body.getAttribute('data-pdfjs-mode') || 'auto';
+  var versions = {
+    latest: body.getAttribute('data-pdfjs-latest'),
+    legacy: body.getAttribute('data-pdfjs-legacy')
+  };
+  var CDN = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/';
+  var SKIP_KEY = 'epub_server_pdfjs_skip_latest';
+  var nativeWrap = document.getElementById('native-wrap');
+  var pdfjsWrap = document.getElementById('pdfjs-wrap');
+  var statusEl = document.getElementById('pdfjs-status');
+  var scrollEl = document.getElementById('pdfjs-scroll');
+  var pageLabel = document.getElementById('pdfjs-page');
+  var verLabel = document.getElementById('pdfjs-ver');
+  var btnPrev = document.getElementById('pdfjs-prev');
+  var btnNext = document.getElementById('pdfjs-next');
+  var btnZoomIn = document.getElementById('pdfjs-zoomin');
+  var btnZoomOut = document.getElementById('pdfjs-zoomout');
+  var btnNative = document.getElementById('btn-native');
+  var btnPdfjs = document.getElementById('btn-pdfjs');
+  var pdfDoc = null;
+  var started = false;
+  var pageNum = 1;
+  var scale = 1.1;
+  var rendering = false;
+  var pending = null;
+
+  function setStatus(msg, isError) {
+    statusEl.textContent = msg || '';
+    statusEl.className = isError ? 'error' : '';
+    statusEl.style.display = msg ? 'block' : 'none';
+  }
+
+  function message(err) {
+    return err && err.message ? err.message : String(err);
+  }
+
+  function updateControls() {
+    if (!pdfDoc) return;
+    pageLabel.textContent = pageNum + ' / ' + pdfDoc.numPages;
+    btnPrev.disabled = pageNum <= 1;
+    btnNext.disabled = pageNum >= pdfDoc.numPages;
+  }
+
+  function withTimeout(promise, ms, what) {
+    return new Promise(function (resolve, reject) {
+      var timer = setTimeout(function () { reject(new Error(what + ' took too long')); }, ms);
+      promise.then(
+        function (value) { clearTimeout(timer); resolve(value); },
+        function (err) { clearTimeout(timer); reject(err); }
+      );
+    });
+  }
+
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = function () { reject(new Error('could not load ' + src)); };
+      document.head.appendChild(s);
+    });
+  }
+
+  // The newest PDF.js is an ES module; the old 3.x release is a classic script that works
+  // on much older engines (smart TVs). import() is called through Function so that a browser
+  // too old to parse it fails here, where it is caught, instead of breaking this whole script.
+  function loadEngine(name) {
+    var v = versions[name];
+    if (name === 'latest') {
+      var load;
+      try { load = new Function('u', 'return import(u)'); } catch (e) {
+        return Promise.reject(new Error('this browser cannot load modern scripts'));
+      }
+      return withTimeout(load(CDN + v + '/pdf.min.mjs'), 20000, 'loading PDF.js ' + v)
+        .then(function (lib) {
+          lib.GlobalWorkerOptions.workerSrc = CDN + v + '/pdf.worker.min.mjs';
+          return lib;
+        });
+    }
+    return withTimeout(loadScript(CDN + v + '/pdf.min.js'), 20000, 'loading PDF.js ' + v)
+      .then(function () {
+        if (!window.pdfjsLib) throw new Error('PDF.js loaded but pdfjsLib is missing');
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = CDN + v + '/pdf.worker.min.js';
+        return window.pdfjsLib;
+      });
+  }
+
+  function openDocument(lib) {
+    // isEvalSupported:false is Mozilla's mitigation for CVE-2024-4367 (a crafted PDF font
+    // could run script in this page); keep it for every version.
+    var task = lib.getDocument({
+      url: pdfUrl,
+      withCredentials: false,
+      isEvalSupported: false,
+      enableXfa: false
+    });
+    return withTimeout(task.promise, 45000, 'opening the PDF');
+  }
+
+  // Draws one page into a fresh canvas and swaps it in when it is done.
+  function drawPage(pdf, num) {
+    return pdf.getPage(num).then(function (page) {
+      var viewport = page.getViewport({ scale: scale });
+      var canvas = document.createElement('canvas');
+      var ctx = canvas.getContext('2d');
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+      var task = page.render({ canvasContext: ctx, canvas: canvas, viewport: viewport });
+      return task.promise.then(function () {
+        scrollEl.innerHTML = '';
+        scrollEl.appendChild(canvas);
+      });
+    });
+  }
+
+  function run(num) {
+    rendering = true;
+    drawPage(pdfDoc, num).then(function () {
+      rendering = false;
+      if (pending !== null) {
+        var p = pending;
+        pending = null;
+        run(p);
+      }
+    }).catch(function (err) {
+      rendering = false;
+      setStatus('Could not render page: ' + message(err), true);
+    });
+  }
+
+  function queue(num) {
+    if (!pdfDoc || num < 1 || num > pdfDoc.numPages) return;
+    pageNum = num;
+    updateControls();
+    if (rendering) {
+      pending = num;
+    } else {
+      run(num);
+    }
+  }
+
+  // An engine only counts as working once it has loaded, opened the file AND drawn page 1.
+  function tryEngine(name) {
+    setStatus('Loading PDF.js ' + versions[name] + '…');
+    return loadEngine(name).then(function (lib) {
+      setStatus('Opening PDF…');
+      return openDocument(lib).then(function (pdf) {
+        return drawPage(pdf, 1).then(function () {
+          pdfDoc = pdf;
+          pageNum = 1;
+          verLabel.textContent = 'PDF.js ' + versions[name];
+          updateControls();
+          setStatus('');
+        });
+      });
+    });
+  }
+
+  function skipLatest() {
+    try { return window.localStorage.getItem(SKIP_KEY) === versions.latest; } catch (e) { return false; }
+  }
+
+  function rememberSkip() {
+    try { window.localStorage.setItem(SKIP_KEY, versions.latest); } catch (e) {}
+  }
+
+  // Problems with the file itself: another PDF.js version would fail the same way.
+  function isFileProblem(err) {
+    var n = err && err.name;
+    return n === 'PasswordException' || n === 'InvalidPDFException' || n === 'MissingPDFException';
+  }
+
+  function engineOrder() {
+    if (mode === 'latest') return ['latest'];
+    if (mode === 'legacy') return ['legacy'];
+    return skipLatest() ? ['legacy'] : ['latest', 'legacy'];
+  }
+
+  function startViewer() {
+    var order = engineOrder();
+    (function next(i) {
+      tryEngine(order[i]).catch(function (err) {
+        var name = order[i];
+        if (!isFileProblem(err) && i + 1 < order.length) {
+          if (name === 'latest') rememberSkip();
+          setStatus('PDF.js ' + versions[name] + ' did not work here (' + message(err) +
+                    '); trying PDF.js ' + versions[order[i + 1]] + '…');
+          next(i + 1);
+          return;
+        }
+        setStatus(
+          'Could not show this PDF with PDF.js ' + versions[name] + ': ' + message(err) +
+          (isFileProblem(err)
+            ? '. The file may be corrupt or password-protected.'
+            : '. If this device has no internet access to cdnjs.cloudflare.com, PDF.js cannot load.'),
+          true
+        );
+      });
+    })(0);
+  }
+
+  function showPdfJs() {
+    nativeWrap.style.display = 'none';
+    pdfjsWrap.classList.add('active');
+    btnPdfjs.style.display = 'none';
+    if (btnNative) btnNative.style.display = '';
+    if (!started) { started = true; startViewer(); }
+  }
+
+  function showNative() {
+    pdfjsWrap.classList.remove('active');
+    nativeWrap.style.display = '';
+    if (btnNative) btnNative.style.display = 'none';
+    btnPdfjs.style.display = '';
+  }
+
+  if (btnPdfjs) btnPdfjs.addEventListener('click', showPdfJs);
+  if (btnNative) btnNative.addEventListener('click', showNative);
+  btnPrev.addEventListener('click', function () { queue(pageNum - 1); });
+  btnNext.addEventListener('click', function () { queue(pageNum + 1); });
+  btnZoomIn.addEventListener('click', function () {
+    scale = Math.min(scale + 0.2, 3);
+    queue(pageNum);
+  });
+  btnZoomOut.addEventListener('click', function () {
+    scale = Math.max(scale - 0.2, 0.4);
+    queue(pageNum);
+  });
+  document.addEventListener('keydown', function (e) {
+    if (!pdfjsWrap.classList.contains('active')) return;
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); queue(pageNum - 1); }
+    if (e.key === 'ArrowRight' || e.key === 'PageDown') { e.preventDefault(); queue(pageNum + 1); }
+  });
+
+  // Switch automatically on engines with no native PDF viewer (VIDAA / many smart-TV
+  // Chromium builds, locked-down WebViews). navigator.pdfViewerEnabled is the modern
+  // signal; older engines fall back to the plugin list.
+  function nativePdfSupported() {
+    if (typeof navigator.pdfViewerEnabled === 'boolean') {
+      return navigator.pdfViewerEnabled;
+    }
+    try {
+      var plugs = navigator.plugins;
+      if (!plugs || !plugs.length) return false;
+      for (var i = 0; i < plugs.length; i++) {
+        var name = (plugs[i].name || '') + ' ' + (plugs[i].filename || '');
+        if (/pdf/i.test(name)) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  if (!nativePdfSupported()) {
+    showPdfJs();
+  }
+})();
+'''
 
 
 def is_pdf_file(path):
@@ -1757,21 +2071,69 @@ def make_pdf_library_html(entries, notice=None):
     )
 
 
-def make_pdf_viewer_html(entry, show_back, notice=None):
+def make_pdf_viewer_html(entry, show_back, notice=None, pdfjs='auto', latest=PDFJS_LATEST_VERSION):
+    """The viewer page: the browser's own PDF viewer, with Mozilla's PDF.js as the fallback
+    for browsers that have none (many smart TVs and locked-down WebViews).
+
+    `pdfjs` is the mode: 'auto' (newest PDF.js, the old one as backup), 'latest', 'legacy', or
+    'off' / False, where nothing is loaded from any other site and no script is included."""
+    mode = 'off' if pdfjs is False else ('auto' if pdfjs is True else pdfjs)
+    pdfjs = mode != 'off'
     title = html.escape(entry.title)
     back = '<a href="/">&#8962; Library</a>' if show_back else ''
     src, dl = f'/pdf/{entry.id}', f'/dl/{entry.id}'
+    pdfjs_buttons = (
+        '<button type="button" id="btn-pdfjs">PDF.js viewer</button>'
+        '<button type="button" id="btn-native" style="display:none">Native viewer</button>'
+        if pdfjs
+        else ''
+    )
+    hint = (
+        'or use the <strong>PDF.js viewer</strong> button above '
+        '(works even when the native plugin and download UI are disabled).'
+        if pdfjs
+        else ''
+    )
+    pdfjs_panel = (
+        '<div id="pdfjs-wrap">'
+        '<div id="pdfjs-toolbar">'
+        '<button type="button" id="pdfjs-prev">&larr; Prev</button>'
+        '<span class="pg" id="pdfjs-page">&ndash;</span>'
+        '<button type="button" id="pdfjs-next">Next &rarr;</button>'
+        '<button type="button" id="pdfjs-zoomout">&minus;</button>'
+        '<button type="button" id="pdfjs-zoomin">+</button>'
+        '<span class="pg" id="pdfjs-ver"></span>'
+        '</div>'
+        '<div id="pdfjs-status"></div>'
+        '<div id="pdfjs-scroll"></div>'
+        '</div>'
+        f'<script>{PDFJS_VIEWER_SCRIPT}</script>'
+        if pdfjs
+        else ''
+    )
+    data_attr = (
+        f' data-pdf-url="{html.escape(src, quote=True)}" data-pdfjs-mode="{html.escape(mode)}"'
+        f' data-pdfjs-latest="{html.escape(latest)}" data-pdfjs-legacy="{PDFJS_LEGACY_VERSION}"'
+        if pdfjs
+        else ''
+    )
     return (
         f'<!DOCTYPE html><html><head>{HTML_META}'
-        f'<title>{title}</title><style>{PDF_CSS}{COMPAT_CSS}</style></head><body class="viewer">'
-        f'{compat_banner(notice)}<div id="bar">{back}<span class="t" title="{title}">{title}</span>'
-        f'<span class="sp"></span>'
+        f'<title>{title}</title><style>{PDF_CSS}{PDFJS_CSS if pdfjs else ""}{COMPAT_CSS}</style></head>'
+        f'<body class="viewer"{data_attr}>'
+        f'{compat_banner(notice)}'
+        f'<div id="bar">{back}<span class="t" title="{title}">{title}</span>'
+        f'<span class="sp"></span>{pdfjs_buttons}'
         f'<a href="{src}" target="_blank">Open in new tab</a>'
         f'<a href="{dl}">Download</a></div>'
+        f'<div id="native-wrap">'
         f'<object data="{src}" type="application/pdf">'
-        f'<p>Your browser can\'t show PDFs inline. '
-        f'<a href="{src}">Open it</a> or <a href="{dl}">download it</a>.</p>'
-        f'</object></body></html>'
+        f"<p>Your browser can't show PDFs inline. "
+        f'<a href="{src}">Open it</a> or <a href="{dl}">download it</a>'
+        f'{", " + hint if hint else "."}</p>'
+        f'</object></div>'
+        f'{pdfjs_panel}'
+        f'</body></html>'
     )
 
 
@@ -1788,7 +2150,9 @@ class PdfHandler(ReaderHandler):
         if path == '/':
             entries = self.library.scan()
             if self.library.single and entries:
-                self._send_entry_page(lambda n: make_pdf_viewer_html(entries[0], False, n))
+                self._send_entry_page(
+                    lambda n: make_pdf_viewer_html(entries[0], False, n, *self._pdfjs())
+                )
             else:
                 self._send_entry_page(lambda n: make_pdf_library_html(entries, n))
             return
@@ -1798,9 +2162,15 @@ class PdfHandler(ReaderHandler):
             self._send(404, b'Not found', 'text/plain; charset=utf-8')
         elif m.group(1) == 'view':
             show_back = not self.library.single
-            self._send_entry_page(lambda n: make_pdf_viewer_html(entry, show_back, n))
+            self._send_entry_page(
+                lambda n: make_pdf_viewer_html(entry, show_back, n, *self._pdfjs())
+            )
         else:
             self._send_pdf(entry, 'attachment' if m.group(1) == 'dl' else 'inline')
+
+    def _pdfjs(self):
+        """(mode, newest version) for the viewer page."""
+        return (self.pdfjs_mode if self.pdfjs else 'off'), self.pdfjs_latest
 
     def _send_pdf(self, entry, disposition):
         gone = (b'That PDF is no longer available', 'text/plain; charset=utf-8')
@@ -1942,6 +2312,285 @@ def lan_addresses():
     return result
 
 
+# ---------------------------------------------------------------------------
+# Config file: settings that would otherwise be typed on every run
+# ---------------------------------------------------------------------------
+
+CONFIG_FILE_NAME = 'epub_server.ini'
+MAX_CONFIG_BYTES = 64 * 1024
+
+CONFIG_TEMPLATE = """\
+# epub_server settings.  Anything you type on the command line wins over this file,
+# and anything left out here uses the built-in default.
+# Lines starting with # or ; are comments.  Yes/no values: yes, no, true, false, on, off.
+
+[server]
+
+# Apply this file automatically whenever you run the script without --config, e.g. just
+#   python3 epub_server.py        (or: uv run epub_server.py)
+# With "no" (or this line missing) the file is only used when you pass --config FILE.
+auto_apply_custom_settings = yes
+
+# Who can open it:
+#   only-me  - only this device (the default)
+#   share    - any device on the same Wi-Fi/network (there is no password: trusted networks only)
+# access = only-me
+
+# Advanced alternative to "access": the exact network address to listen on
+# (127.0.0.1 = this device only, 0.0.0.0 = every network connection).
+# Use either "access" or "host", not both.
+# host = 127.0.0.1
+
+# Port number, 1-65535.
+# port = 8000
+
+# Open a browser tab automatically when the server starts.
+# open_browser = yes
+
+# Print every request in the terminal (failed requests are always printed).
+# verbose = no
+
+# Let books run their own JavaScript / load things from https:// sites.
+# Both are off by default for safety; turn on only for books you trust.
+# allow_scripts = no
+# allow_remote = no
+
+# PDF pages: browsers that have no PDF viewer of their own (many smart TVs, e.g. VIDAA) use
+# PDF.js, loaded from cdnjs.cloudflare.com only when needed.
+#   auto   - try the newest PDF.js first and fall back to the old 3.11.174 if it doesn't work
+#            on that device (the default)
+#   latest - the newest only         legacy - the old 3.11.174 only
+#   off    - never load anything from another site (same as "no")
+# pdfjs = auto
+# Which version "latest" means (default: the one this script was released with).
+# pdfjs_latest_version = 6.5.438
+
+# A book, PDF or folder to serve when none is given on the command line, so that
+# running the script with no arguments opens the book you want.
+# A relative path is relative to this file's folder.  ~ means your home folder.
+# path = ~/Books/my-book.epub
+"""
+CONFIG_KEYS = (
+    'auto_apply_custom_settings',
+    'access',
+    'host',
+    'port',
+    'open_browser',
+    'verbose',
+    'allow_scripts',
+    'allow_remote',
+    'pdfjs',
+    'pdfjs_latest_version',
+    'path',
+)
+
+
+# Other spellings accepted for a setting name (after lower-casing and '-' -> '_').
+CONFIG_ALIASES = {
+    'auto_apply_settings': 'auto_apply_custom_settings',
+    'auto_apply': 'auto_apply_custom_settings',
+}
+
+
+class ConfigError(ValueError):
+    """The config file can't be used; the message says why, in plain words."""
+
+
+def user_config_path():
+    """Where the per-user config file lives (it need not exist)."""
+    if os.name == 'nt':
+        base = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
+    else:
+        base = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    return base / 'epub_server' / 'config.ini'
+
+
+def find_config_file():
+    """The config file to use when none was named: next to this script, then the per-user one.
+
+    The current folder is deliberately NOT searched, so a folder you merely happen to be
+    standing in (a downloaded book, say) can't change how the server behaves."""
+    for candidate in (Path(__file__).resolve().with_name(CONFIG_FILE_NAME), user_config_path()):
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def read_config(path):
+    """Read and check a config file; returns only the settings it actually sets."""
+    path = Path(path)
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read(MAX_CONFIG_BYTES + 1)
+    except OSError as exc:
+        raise ConfigError(f'cannot be read ({exc.strerror or exc})') from None
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise ConfigError(f'is too big to be a settings file (over {MAX_CONFIG_BYTES // 1024} KB)')
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        raise ConfigError('is not UTF-8 text') from None
+    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=('#',))
+    parser.optionxform = lambda key: CONFIG_ALIASES.get(
+        key.strip().lower().replace('-', '_'), key.strip().lower().replace('-', '_')
+    )
+    try:
+        parser.read_string(text, source=path.name)
+    except configparser.MissingSectionHeaderError:
+        raise ConfigError('must start with a [server] line before the settings') from None
+    except configparser.Error as exc:
+        raise ConfigError(f'is not valid settings text ({" ".join(str(exc).split())})') from None
+    unknown_sections = [name for name in parser.sections() if name.lower() != 'server']
+    if unknown_sections:
+        raise ConfigError(f'has an unknown section [{unknown_sections[0]}]; only [server] is used')
+    names = [name for name in parser.sections() if name.lower() == 'server']
+    if not names:
+        return {}
+    section = parser[names[0]]
+    for key in section:
+        if key not in CONFIG_KEYS:
+            raise ConfigError(f'has an unknown setting "{key}" (valid: {", ".join(CONFIG_KEYS)})')
+    settings = {}
+    for key in (
+        'auto_apply_custom_settings',
+        'open_browser',
+        'verbose',
+        'allow_scripts',
+        'allow_remote',
+    ):
+        if key in section:
+            try:
+                settings[key] = section.getboolean(key)
+            except ValueError:
+                raise ConfigError(f'"{key}" must be yes or no, not "{section[key]}"') from None
+    if 'pdfjs' in section:
+        settings['pdfjs'] = parse_pdfjs_mode(section['pdfjs'], ConfigError)
+    if 'pdfjs_latest_version' in section:
+        try:
+            settings['pdfjs_latest_version'] = pdfjs_version_text(section['pdfjs_latest_version'])
+        except argparse.ArgumentTypeError as exc:
+            raise ConfigError(f'"pdfjs_latest_version": {exc}') from None
+    if 'port' in section:
+        try:
+            settings['port'] = port_number(section['port'].strip())
+        except argparse.ArgumentTypeError as exc:
+            raise ConfigError(f'"port": {exc}') from None
+    if 'access' in section:
+        access = section['access'].strip().lower().replace('_', '-')
+        if access not in ('only-me', 'share'):
+            raise ConfigError(f'"access" must be only-me or share, not "{section["access"]}"')
+        settings['access'] = access
+    if 'host' in section:
+        settings['host'] = section['host'].strip()
+        if not settings['host']:
+            raise ConfigError('"host" is empty')
+    if 'access' in settings and 'host' in settings:
+        raise ConfigError('sets both "access" and "host"; use one of them')
+    if 'path' in section:
+        value = section['path'].strip()
+        if not value:
+            raise ConfigError('"path" is empty')
+        settings['path'] = str((path.resolve().parent / Path(value).expanduser()))
+    return settings
+
+
+def write_new_file_atomically(target, text):
+    """Create `target` with `text` so that it either exists completely or not at all.
+
+    The text goes to a temporary file in the same folder first, is flushed to disk, and is
+    then put in place without overwriting anything. A crash or a full disk part-way can leave
+    a stray temporary file, never a half-written settings file. Raises FileExistsError if
+    `target` is already there."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(dir=str(target.parent), prefix='.epub_server_', suffix='.tmp')
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(str(temp), str(target))  # fails, atomically, if target exists
+        except FileExistsError:
+            raise
+        except OSError:  # a file system without hard links: check, then rename
+            if target.exists():
+                raise FileExistsError(str(target)) from None
+            os.rename(str(temp), str(target))
+    finally:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+
+
+def parse_pdfjs_mode(text, error=ValueError):
+    """auto / latest / legacy / off; yes means auto and no means off."""
+    word = text.strip().lower()
+    word = {'yes': 'auto', 'true': 'auto', 'on': 'auto', '1': 'auto'}.get(word, word)
+    word = {'no': 'off', 'false': 'off', '0': 'off'}.get(word, word)
+    if word not in PDFJS_MODES:
+        raise error(
+            f'"pdfjs" must be auto, latest, legacy or off (yes and no also work), not "{text.strip()}"'
+        )
+    return word
+
+
+def pdfjs_version_text(text):
+    """argparse type: a PDF.js version number such as 6.5.438 (it ends up in a URL)."""
+    value = text.strip()
+    if not _PDFJS_VERSION_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError(f'{value!r} is not a version number like 6.5.438')
+    return value
+
+
+def init_config(target):
+    """Write the commented template to `target`. Returns 0, or an error message to exit with."""
+    try:
+        write_new_file_atomically(target, CONFIG_TEMPLATE)
+    except FileExistsError:
+        return f'error: {target} already exists; edit it, or remove it first to start over'
+    except OSError as exc:
+        return f'error: could not write {target}: {exc.strerror or exc}'
+    print(f'wrote {target}\nEdit it to change the defaults; command-line options still win.')
+    return 0
+
+
+def describe_config(path):
+    """(is it fine, one line saying what the file is) for `check_config`."""
+    if not path.is_file():
+        return True, 'not found (that is fine: built-in defaults are used)'
+    try:
+        found = read_config(path)
+    except ConfigError as exc:
+        return False, f'CORRUPTED or invalid: it {exc}. It will be skipped.'
+    if found.get('auto_apply_custom_settings'):
+        return True, f'valid, and applied automatically ({len(found) - 1} setting(s) changed)'
+    return (
+        True,
+        'valid, but auto_apply_custom_settings is not "yes", so it is only used with --config',
+    )
+
+
+def check_config(explicit):
+    """Report on the settings file(s) without starting a server; returns the exit status."""
+    if explicit is not None:
+        ok, message = describe_config(explicit)
+        if not explicit.is_file():
+            ok, message = False, 'not found'
+        print(f'{explicit}: {message}')
+        return 0 if ok else 1
+    status = 0
+    for candidate in (Path(__file__).resolve().with_name(CONFIG_FILE_NAME), user_config_path()):
+        ok, message = describe_config(candidate)
+        print(f'{candidate}: {message}')
+        status = status or (0 if ok else 1)
+    return status
+
+
 def port_number(text):
     """argparse type: a TCP port, 1-65535."""
     try:
@@ -1960,10 +2609,34 @@ def main():
     parser.add_argument(
         'epub',
         metavar='path',
-        help='.epub or .pdf file, or a folder: either extracted epub contents or PDFs to host',
+        nargs='?',
+        help='.epub or .pdf file, or a folder: either extracted epub contents or PDFs to host '
+        '(may be left out if a config file sets "path")',
     )
-    parser.add_argument('--port', type=port_number, default=8000)
-    parser.add_argument('--host', default='127.0.0.1')
+    who = parser.add_mutually_exclusive_group()
+    who.add_argument(
+        '--only-me',
+        action='store_true',
+        help='only this device can open it (this is the default)',
+    )
+    who.add_argument(
+        '--share',
+        action='store_true',
+        help='any device on the same Wi-Fi/network can open it (no password: use trusted networks)',
+    )
+    parser.add_argument(
+        '--port',
+        type=port_number,
+        default=None,
+        help='port number to serve on, 1-65535 (default 8000)',
+    )
+    parser.add_argument(
+        '--host',
+        default=None,
+        metavar='ADDRESS',
+        help='advanced: the exact network address to listen on, instead of --only-me/--share '
+        '(127.0.0.1 = this device only, 0.0.0.0 = every network connection)',
+    )
     parser.add_argument(
         '--no-browser', action='store_true', help="don't try to auto-open a browser tab"
     )
@@ -1978,12 +2651,105 @@ def main():
         help='let EPUBs run their own JavaScript (blocked by default; only for books you trust)',
     )
     parser.add_argument(
+        '--pdfjs',
+        metavar='MODE',
+        type=lambda text: parse_pdfjs_mode(text, argparse.ArgumentTypeError),
+        default=None,
+        help='PDF.js fallback viewer for browsers with no PDF viewer of their own (many smart TVs; '
+        'loaded from cdnjs.cloudflare.com): auto = newest, with the old 3.11.174 as backup '
+        '(default); latest = newest only; legacy = old only; off = never load it',
+    )
+    parser.add_argument(
+        '--no-pdfjs',
+        action='store_true',
+        help='same as --pdfjs off',
+    )
+    parser.add_argument(
+        '--pdfjs-latest-version',
+        metavar='X.Y.Z',
+        type=pdfjs_version_text,
+        default=None,
+        help=f'which PDF.js release "latest" means (default {PDFJS_LATEST_VERSION})',
+    )
+    parser.add_argument(
         '--allow-remote',
         action='store_true',
         help='let EPUBs load images, fonts and styles from https:// sites '
         '(blocked by default, so a book cannot phone home while you read it)',
     )
+    configuration = parser.add_argument_group('settings file')
+    configuration.add_argument(
+        '--config',
+        metavar='FILE',
+        help=f'read default settings from this file (otherwise {CONFIG_FILE_NAME} next to this '
+        'script, then the per-user config file, is used if it exists)',
+    )
+    configuration.add_argument(
+        '--no-config', action='store_true', help='ignore any settings file this time'
+    )
+    configuration.add_argument(
+        '--init-config',
+        action='store_true',
+        help='write a commented settings file (to --config FILE, or the per-user location) and exit',
+    )
+    configuration.add_argument(
+        '--check-config',
+        action='store_true',
+        help='report whether the settings file is valid, without starting a server',
+    )
     args = parser.parse_args()
+    if args.host is not None and (args.share or args.only_me):
+        parser.error('--host cannot be combined with --share or --only-me (pick one way to choose)')
+    if args.config and args.no_config:
+        parser.error('--config cannot be combined with --no-config')
+    if args.check_config:
+        sys.exit(check_config(Path(args.config) if args.config else None))
+    if args.init_config:
+        sys.exit(init_config(Path(args.config) if args.config else user_config_path()))
+    settings, config_file = {}, None
+    if args.config and not args.no_config:
+        # A file you named yourself is always applied, and a problem with it is an error.
+        config_file = Path(args.config)
+        try:
+            settings = read_config(config_file)
+        except ConfigError as exc:
+            sys.exit(f'error: settings file {config_file} {exc}')
+        print(f'using settings from {config_file}')
+    elif not args.no_config:
+        # A file found automatically is applied only if it is valid AND says to apply itself;
+        # a missing, unreadable or broken one is simply skipped.
+        candidate = find_config_file()
+        if candidate is not None:
+            try:
+                found = read_config(candidate)
+            except ConfigError as exc:
+                warn(f'ignoring settings file {candidate}: it {exc}')
+            else:
+                if found.get('auto_apply_custom_settings'):
+                    settings, config_file = found, candidate
+                    print(f'using settings from {candidate} (auto-applied)')
+    if args.share or args.only_me or args.host is not None:
+        chosen_host = '0.0.0.0' if args.share else args.host or '127.0.0.1'  # the command line wins
+    elif settings.get('access') == 'share':
+        chosen_host = '0.0.0.0'
+    else:
+        chosen_host = settings.get('host') or '127.0.0.1'
+    args.host = chosen_host
+    args.port = args.port if args.port is not None else settings.get('port', 8000)
+    args.no_browser = args.no_browser or not settings.get('open_browser', True)
+    for flag in ('verbose', 'allow_scripts', 'allow_remote'):
+        setattr(args, flag, getattr(args, flag) or settings.get(flag, False))
+    if args.no_pdfjs and args.pdfjs not in (None, 'off'):
+        parser.error('--no-pdfjs cannot be combined with --pdfjs ' + args.pdfjs)
+    args.pdfjs = 'off' if args.no_pdfjs else args.pdfjs or settings.get('pdfjs', 'auto')
+    args.pdfjs_latest_version = (
+        args.pdfjs_latest_version or settings.get('pdfjs_latest_version') or PDFJS_LATEST_VERSION
+    )
+    args.epub = args.epub or settings.get('path')
+    if not args.epub:
+        parser.error(
+            'the following arguments are required: path (or set "path" in a settings file)'
+        )
     for stream in (sys.stdout, sys.stderr):
         # A Windows console in a legacy code page would crash on a title with, say, CJK
         # characters; show a replacement mark instead.
@@ -2000,6 +2766,20 @@ def main():
         print(f'hosting {count} PDF file{"" if count == 1 else "s"} from {library.root}')
         PdfHandler.library = library
         PdfHandler.verbose = args.verbose
+        PdfHandler.pdfjs = args.pdfjs != 'off'
+        PdfHandler.pdfjs_mode = args.pdfjs if PdfHandler.pdfjs else 'auto'
+        PdfHandler.pdfjs_latest = args.pdfjs_latest_version
+        if PdfHandler.pdfjs:
+            newest, old = args.pdfjs_latest_version, PDFJS_LEGACY_VERSION
+            plan = {
+                'auto': f'PDF.js {newest}, with {old} as backup',
+                'latest': f'PDF.js {newest} only',
+                'legacy': f'PDF.js {old} only',
+            }[args.pdfjs]
+            print(
+                f'PDF.js fallback is on ({plan}): browsers with no PDF viewer of their own '
+                '(many smart TVs) load it from cdnjs.cloudflare.com; --pdfjs off turns it off'
+            )
         run_server(PdfHandler, args.host, args.port, args.no_browser)
         return
     try:
