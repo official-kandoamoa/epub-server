@@ -1527,7 +1527,7 @@ class ConfigFileTests(TempDirCase):
         page, out = self.pdf_cli()
         self.assertIn('cdnjs.cloudflare.com', page)
         self.assertIn('PDF.js fallback is on', out)
-        page, out = self.pdf_cli('--no-pdfjs')
+        page, out = self.pdf_cli('--no-pdfjs', '--no-pdf-images')
         self.assertNotIn('cdnjs', page)
         self.assertNotIn('<script', page)
         self.assertNotIn('PDF.js fallback is on', out)
@@ -1763,6 +1763,68 @@ class BrowserCompatibilityTests(TempDirCase):
         srv = Running(quiet_handler(es.PdfHandler, library=library))
         self.addCleanup(srv.close)
         return srv, library
+
+    TWO_PAGE_PDF = (
+        b'%PDF-1.4\n'
+        b'1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n'
+        b'2 0 obj<</Type/Pages/Kids[3 0 R 4 0 R]/Count 2>>endobj\n'
+        b'3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]>>endobj\n'
+        b'4 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]>>endobj\n'
+        b'trailer<</Root 1 0 R/Size 5>>\n%%EOF\n'
+    )
+
+    def serve_images(self, **attrs):
+        root = self.tmp / 'imgpdf'
+        root.mkdir(exist_ok=True)
+        (root / 'a.pdf').write_bytes(self.TWO_PAGE_PDF)
+        library = es.PdfLibrary(root / 'a.pdf')
+        renderer = es.PdfPageRenderer(es.find_pdf_renderer())
+        srv = Running(
+            quiet_handler(es.PdfHandler, library=library, page_renderer=renderer, **attrs)
+        )
+        self.addCleanup(srv.close)
+        return srv, library.scan()[0]
+
+    @unittest.skipUnless(es.find_pdf_renderer(), 'pdftoppm is not installed')
+    def test_pdf_pages_can_be_loaded_as_png_or_jpg(self):
+        srv, entry = self.serve_images()
+        page = srv.get('/').body.decode()
+        for part in ('id="btn-png"', 'id="btn-jpg"', 'id="img-wrap"', '/img/'):
+            self.assertIn(part, page)
+        png = srv.get(f'/img/{entry.id}/1.png')
+        self.assertEqual((png.status, png.headers['content-type']), (200, 'image/png'))
+        self.assertTrue(png.body.startswith(b'\x89PNG'))
+        jpg = srv.get(f'/img/{entry.id}/2.jpg')
+        self.assertEqual((jpg.status, jpg.headers['content-type']), (200, 'image/jpeg'))
+        self.assertTrue(jpg.body.startswith(b'\xff\xd8'))
+        self.assertEqual(srv.get(f'/img/{entry.id}/1.png').body, png.body)  # from the cache
+        for bad in ('3.png', '0.png', '01.png', '1.gif', '99999.png', '1.png/x', '../1.png'):
+            self.assertEqual(srv.get(f'/img/{entry.id}/{bad}').status, 404, bad)
+        self.assertEqual(srv.get('/img/000000000000/1.png').status, 404)
+
+    def test_without_a_renderer_there_are_no_image_buttons_or_routes(self):
+        srv, library = self.serve_pdfs(True)
+        page = srv.get('/').body.decode()
+        self.assertNotIn('btn-png', page)
+        self.assertNotIn('img-wrap', page)
+        self.assertEqual(srv.get(f'/img/{library.scan()[0].id}/1.png').status, 404)
+
+    @unittest.skipUnless(es.find_pdf_renderer(), 'pdftoppm is not installed')
+    def test_no_pdf_images_switch_and_setting(self):
+        root = self.tmp / 'switch'
+        root.mkdir()
+        (root / 'a.pdf').write_bytes(self.TWO_PAGE_PDF)
+        cli = Cli(root / 'a.pdf')
+        try:
+            self.assertIn('btn-png', cli.get('/').body.decode())
+        finally:
+            out, _ = cli.stop()
+        self.assertIn('PDF page images', out)
+        cli = Cli(root / 'a.pdf', '--no-pdf-images')
+        try:
+            self.assertNotIn('btn-png', cli.get('/').body.decode())
+        finally:
+            cli.stop()
 
     def test_pdf_pages_warn_phones_and_old_browsers(self):
         for single in (True, False):

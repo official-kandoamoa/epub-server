@@ -135,6 +135,7 @@ This starts a local server and opens your browser to it automatically.
 | `--pdfjs MODE` | auto          | PDF.js fallback: `auto` (newest, old 3.11.174 as backup), `latest` (newest only), `legacy` (old only), `off` |
 | `--no-pdfjs`   | off           | Same as `--pdfjs off` (nothing is loaded from other sites) |
 | `--pdfjs-latest-version X.Y.Z` | 6.5.438 | Which release "latest" means |
+| `--no-pdf-images` | off | Don't offer PDF pages as PNG/JPG images |
 | `--config FILE` | see below    | Read default settings from this file (see [Settings file](#settings-file-run-it-with-no-arguments)) |
 | `--no-config`  | off           | Ignore any settings file this time                        |
 | `--init-config` |              | Write a commented settings file and exit                  |
@@ -179,6 +180,7 @@ Every command-line option has a setting:
 | `allow_remote` | yes / no | `--allow-remote` |
 | `pdfjs` | auto / latest / legacy / off (yes = auto, no = off) | `--pdfjs` |
 | `pdfjs_latest_version` | a version like 6.5.438 | `--pdfjs-latest-version` |
+| `pdf_images` | yes / no | `--no-pdf-images` when `no` |
 | `path` | a book, PDF or folder | the `path` argument |
 
 `--config`, `--no-config`, `--init-config` and `--help` are about the file
@@ -305,6 +307,18 @@ library; after that the document is local. Start with `--pdfjs off` (or set
 `pdfjs = off`) to turn the fallback off so nothing is loaded from other sites. You
 can switch back to the native viewer with the button that appears. "Open in new tab" and "Download" remain
 available when the environment allows them.
+
+**Page images (PNG / JPG).** When `pdftoppm` (from poppler-utils; e.g.
+`apt install poppler-utils`, `pkg install poppler` on Termux, `brew install
+poppler`) is installed, the viewer's top bar also offers **Page images (PNG)**
+and **Page images (JPG)**. The server draws one page at a time (at 120 DPI, two
+at once at most, recent pages cached in memory) and the page shows it as a
+plain picture with Prev/Next, arrow keys, and a PNG/JPG switch. It needs no
+JavaScript library and no outside site, so it also works on TVs that can't run
+PDF.js. Pages are pictures: text can't be selected or searched, and links are
+gone. Without `pdftoppm` the buttons don't appear; `--no-pdf-images` hides them
+even if it's installed. The images are available directly too, at
+`/img/<id>/<page>.png` or `.jpg`.
 
 ### Troubleshooting
 

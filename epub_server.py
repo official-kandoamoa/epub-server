@@ -54,7 +54,9 @@ import mimetypes
 import os
 import posixpath
 import re
+import shutil
 import stat
+import subprocess
 import tempfile
 import threading
 import traceback
@@ -1618,6 +1620,83 @@ class ReaderHandler(BaseHTTPRequestHandler):
 
 PDF_MAGIC = b'%PDF-'
 PDF_URL_RE = re.compile(r'/(view|pdf|dl)/([0-9a-f]{12})')
+PDF_IMAGE_URL_RE = re.compile(r'/img/([0-9a-f]{12})/([1-9][0-9]{0,3})\.(png|jpg)')
+PDF_IMAGE_DPI = 120
+PDF_IMAGE_TIMEOUT = 60
+PDF_IMAGE_CACHE_BYTES = 48 * 1024 * 1024
+
+
+def find_pdf_renderer():
+    """Path of `pdftoppm` (poppler) if it is installed, else None. It is the only thing that
+    can turn PDF pages into PNG/JPG here, since this script uses nothing but the standard library.
+    """
+    return shutil.which('pdftoppm')
+
+
+class PdfPageRenderer:
+    """Renders single PDF pages to PNG/JPG with pdftoppm, a few at a time, remembering recent ones."""
+
+    def __init__(self, exe, dpi=PDF_IMAGE_DPI, cache_bytes=PDF_IMAGE_CACHE_BYTES, workers=2):
+        self.exe, self.dpi, self.cache_bytes = exe, dpi, cache_bytes
+        self._slots = threading.BoundedSemaphore(workers)
+        self._cache, self._cached, self._lock = OrderedDict(), 0, threading.Lock()
+
+    def render(self, path, key, page, fmt):
+        """The image bytes, None when there is no such page / it can't be drawn, or False when
+        the renderer is busy."""
+        key = (key, page, fmt)
+        with self._lock:
+            hit = self._cache.get(key)
+            if hit is not None:
+                self._cache.move_to_end(key)
+                return hit
+        if not self._slots.acquire(timeout=PDF_IMAGE_TIMEOUT / 2):
+            return False
+        data = None
+        try:
+            # pdftoppm cannot write to stdout, so it draws into a private temporary folder.
+            with tempfile.TemporaryDirectory(prefix='epub_server_page_') as folder:
+                out = Path(folder) / 'page'
+                command = [
+                    self.exe,
+                    '-png' if fmt == 'png' else '-jpeg',
+                    '-r',
+                    str(self.dpi),
+                    '-f',
+                    str(page),
+                    '-l',
+                    str(page),
+                    '-singlefile',
+                    str(Path(path).resolve()),  # absolute, so it can never look like an option
+                    str(out),
+                ]
+                try:
+                    done = subprocess.run(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=PDF_IMAGE_TIMEOUT,
+                    )
+                    produced = out.with_suffix('.png' if fmt == 'png' else '.jpg')
+                    if done.returncode == 0 and produced.is_file():
+                        if produced.stat().st_size <= self.cache_bytes:
+                            data = produced.read_bytes()
+                except (OSError, subprocess.SubprocessError):
+                    data = None
+        finally:
+            self._slots.release()
+        if not data:
+            return None
+        with self._lock:
+            if key in self._cache:
+                return data
+            self._cache[key] = data
+            self._cached += len(data)
+            while self._cached > self.cache_bytes and len(self._cache) > 1:
+                self._cached -= len(self._cache.popitem(last=False)[1])
+        return data
+
 
 PDF_CSS = (
     'body{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px}'
@@ -1655,6 +1734,56 @@ PDFJS_CSS = (
     '#pdfjs-status{color:#ccc;padding:24px;font:14px sans-serif}'
     '#pdfjs-status.error{color:#f88}'
 )
+
+# Page-image viewer (PNG / JPG), only sent when pdftoppm is available. It needs no outside site.
+PDF_IMAGE_CSS = (
+    '#img-wrap{display:none;flex:1 1 auto;flex-direction:column;min-height:0;background:#525659}'
+    '#img-wrap.active{display:flex}'
+    '#img-toolbar{background:#323639;color:#eee;font-size:13px;padding:6px 12px;'
+    'display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center}'
+    '#img-toolbar button{background:#4a4d50;color:#eee;border:0;border-radius:3px;'
+    'padding:4px 10px;cursor:pointer;font:inherit}'
+    '#img-toolbar button:disabled{opacity:.4;cursor:default}'
+    '#img-toolbar .pg{min-width:4.5em;text-align:center}'
+    '#img-scroll{flex:1 1 auto;overflow:auto;text-align:center;padding:12px}'
+    '#img-scroll img{max-width:100%;height:auto;background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.4)}'
+)
+
+PDF_IMAGE_SCRIPT = r'''
+(function () {
+  var wrap = document.getElementById('img-wrap'), img = document.getElementById('img-view');
+  var label = document.getElementById('img-page'), next = document.getElementById('img-next');
+  var prev = document.getElementById('img-prev'), fmtBtn = document.getElementById('img-fmt');
+  var id = wrap.getAttribute('data-id'), page = 1, fmt = 'png', last = 0;
+  function hideOthers(on) {
+    var n = document.getElementById('native-wrap'), j = document.getElementById('pdfjs-wrap');
+    if (n) n.style.display = on ? 'none' : '';
+    if (j && on) j.className = j.className.replace(/\bactive\b/, '');
+  }
+  function show() {
+    label.textContent = page + (last ? ' / ' + last : '');
+    prev.disabled = page <= 1; next.disabled = last > 0 && page >= last;
+    fmtBtn.textContent = fmt.toUpperCase();
+    img.src = '/img/' + id + '/' + page + '.' + fmt;
+  }
+  img.onerror = function () {
+    if (page > 1) { last = page - 1; page = last; show(); } else { label.textContent = 'no image'; }
+  };
+  function open(f) { fmt = f; wrap.className = 'active'; hideOthers(true); show(); }
+  document.getElementById('btn-png').onclick = function () { open('png'); };
+  document.getElementById('btn-jpg').onclick = function () { open('jpg'); };
+  prev.onclick = function () { if (page > 1) { page--; show(); } };
+  next.onclick = function () { if (!last || page < last) { page++; show(); } };
+  fmtBtn.onclick = function () { fmt = fmt === 'png' ? 'jpg' : 'png'; show(); };
+  document.getElementById('img-back').onclick = function () {
+    wrap.className = ''; hideOthers(false);
+  };
+  document.addEventListener('keydown', function (e) {
+    if (wrap.className.indexOf('active') < 0) return;
+    if (e.key === 'ArrowRight') next.onclick(); else if (e.key === 'ArrowLeft') prev.onclick();
+  });
+})();
+'''
 
 # Mozilla PDF.js, loaded from a CDN, only when the browser has no PDF viewer of its own (or
 # the "PDF.js viewer" button is pressed). The PDF itself is still fetched from this server.
@@ -2071,7 +2200,9 @@ def make_pdf_library_html(entries, notice=None):
     )
 
 
-def make_pdf_viewer_html(entry, show_back, notice=None, pdfjs='auto', latest=PDFJS_LATEST_VERSION):
+def make_pdf_viewer_html(
+    entry, show_back, notice=None, pdfjs='auto', latest=PDFJS_LATEST_VERSION, images=False
+):
     """The viewer page: the browser's own PDF viewer, with Mozilla's PDF.js as the fallback
     for browsers that have none (many smart TVs and locked-down WebViews).
 
@@ -2082,6 +2213,27 @@ def make_pdf_viewer_html(entry, show_back, notice=None, pdfjs='auto', latest=PDF
     title = html.escape(entry.title)
     back = '<a href="/">&#8962; Library</a>' if show_back else ''
     src, dl = f'/pdf/{entry.id}', f'/dl/{entry.id}'
+    image_buttons = (
+        '<button type="button" id="btn-png">Page images (PNG)</button>'
+        '<button type="button" id="btn-jpg">Page images (JPG)</button>'
+        if images
+        else ''
+    )
+    image_panel = (
+        f'<div id="img-wrap" data-id="{entry.id}">'
+        '<div id="img-toolbar">'
+        '<button type="button" id="img-prev">&larr; Prev</button>'
+        '<span class="pg" id="img-page">&ndash;</span>'
+        '<button type="button" id="img-next">Next &rarr;</button>'
+        '<button type="button" id="img-fmt">PNG</button>'
+        '<button type="button" id="img-back">Back to PDF</button>'
+        '</div>'
+        '<div id="img-scroll"><img id="img-view" alt="PDF page"></div>'
+        '</div>'
+        f'<script>{PDF_IMAGE_SCRIPT}</script>'
+        if images
+        else ''
+    )
     pdfjs_buttons = (
         '<button type="button" id="btn-pdfjs">PDF.js viewer</button>'
         '<button type="button" id="btn-native" style="display:none">Native viewer</button>'
@@ -2119,11 +2271,11 @@ def make_pdf_viewer_html(entry, show_back, notice=None, pdfjs='auto', latest=PDF
     )
     return (
         f'<!DOCTYPE html><html><head>{HTML_META}'
-        f'<title>{title}</title><style>{PDF_CSS}{PDFJS_CSS if pdfjs else ""}{COMPAT_CSS}</style></head>'
+        f'<title>{title}</title><style>{PDF_CSS}{PDFJS_CSS if pdfjs else ""}{PDF_IMAGE_CSS if images else ""}{COMPAT_CSS}</style></head>'
         f'<body class="viewer"{data_attr}>'
         f'{compat_banner(notice)}'
         f'<div id="bar">{back}<span class="t" title="{title}">{title}</span>'
-        f'<span class="sp"></span>{pdfjs_buttons}'
+        f'<span class="sp"></span>{image_buttons}{pdfjs_buttons}'
         f'<a href="{src}" target="_blank">Open in new tab</a>'
         f'<a href="{dl}">Download</a></div>'
         f'<div id="native-wrap">'
@@ -2132,7 +2284,7 @@ def make_pdf_viewer_html(entry, show_back, notice=None, pdfjs='auto', latest=PDF
         f'<a href="{src}">Open it</a> or <a href="{dl}">download it</a>'
         f'{", " + hint if hint else "."}</p>'
         f'</object></div>'
-        f'{pdfjs_panel}'
+        f'{pdfjs_panel}{image_panel}'
         f'</body></html>'
     )
 
@@ -2140,6 +2292,7 @@ def make_pdf_viewer_html(entry, show_back, notice=None, pdfjs='auto', latest=PDF
 class PdfHandler(ReaderHandler):
     library = None
     for_pdf = True
+    page_renderer = None  # a PdfPageRenderer when PNG/JPG page images are available
     csp = None  # PDFs are shown by the browser's own viewer; a script policy would get in its way
     # No Cross-Origin-Resource-Policy here: some browsers fetch a PDF for their built-in
     # viewer in a way that header can break.
@@ -2151,10 +2304,16 @@ class PdfHandler(ReaderHandler):
             entries = self.library.scan()
             if self.library.single and entries:
                 self._send_entry_page(
-                    lambda n: make_pdf_viewer_html(entries[0], False, n, *self._pdfjs())
+                    lambda n: make_pdf_viewer_html(
+                        entries[0], False, n, *self._pdfjs(), images=self.page_renderer is not None
+                    )
                 )
             else:
                 self._send_entry_page(lambda n: make_pdf_library_html(entries, n))
+            return
+        image = PDF_IMAGE_URL_RE.fullmatch(path)
+        if image:
+            self._send_page_image(image)
             return
         m = PDF_URL_RE.fullmatch(path)
         entry = self.library.find(m.group(2)) if m else None
@@ -2163,7 +2322,9 @@ class PdfHandler(ReaderHandler):
         elif m.group(1) == 'view':
             show_back = not self.library.single
             self._send_entry_page(
-                lambda n: make_pdf_viewer_html(entry, show_back, n, *self._pdfjs())
+                lambda n: make_pdf_viewer_html(
+                    entry, show_back, n, *self._pdfjs(), images=self.page_renderer is not None
+                )
             )
         else:
             self._send_pdf(entry, 'attachment' if m.group(1) == 'dl' else 'inline')
@@ -2171,6 +2332,28 @@ class PdfHandler(ReaderHandler):
     def _pdfjs(self):
         """(mode, newest version) for the viewer page."""
         return (self.pdfjs_mode if self.pdfjs else 'off'), self.pdfjs_latest
+
+    def _send_page_image(self, match):
+        entry = self.library.find(match.group(1))
+        plain = 'text/plain; charset=utf-8'
+        if entry is None or self.page_renderer is None or not self.library.is_inside(entry.path):
+            self._send(404, b'Not found', plain)
+            return
+        try:
+            st = entry.path.stat()
+        except OSError:
+            self._send(404, b'That PDF is no longer available', plain)
+            return
+        page, fmt = int(match.group(2)), match.group(3)
+        key = f'{entry.id}-{st.st_mtime_ns:x}-{st.st_size:x}'
+        data = self.page_renderer.render(entry.path, key, page, fmt)
+        if data is False:
+            self._send(503, b'Busy drawing other pages; try again', plain)
+        elif data is None:
+            self._send(404, b'No such page', plain)
+        else:
+            ctype = 'image/png' if fmt == 'png' else 'image/jpeg'
+            self._send(200, data, ctype, f'"{key}-{page}-{fmt}"')
 
     def _send_pdf(self, entry, disposition):
         gone = (b'That PDF is no longer available', 'text/plain; charset=utf-8')
@@ -2377,6 +2560,9 @@ auto_apply_custom_settings = yes
 # pdfjs = auto
 # Which version "latest" means (default: the one this script was released with).
 # pdfjs_latest_version = 6.5.438
+# PDF pages: offer "Page images (PNG / JPG)" in the viewer. It needs the free `pdftoppm` tool
+# (poppler-utils) installed; without it the buttons simply don't appear.
+# pdf_images = yes
 
 # A book, PDF or folder to serve when none is given on the command line, so that
 # running the script with no arguments opens the book you want.
@@ -2394,6 +2580,7 @@ CONFIG_KEYS = (
     'allow_remote',
     'pdfjs',
     'pdfjs_latest_version',
+    'pdf_images',
     'path',
 )
 
@@ -2485,6 +2672,7 @@ def read_config(path):
         'verbose',
         'allow_scripts',
         'allow_remote',
+        'pdf_images',
     ):
         if key in section:
             try:
@@ -2697,6 +2885,11 @@ def main():
         help=f'which PDF.js release "latest" means (default {PDFJS_LATEST_VERSION})',
     )
     parser.add_argument(
+        '--no-pdf-images',
+        action='store_true',
+        help='do not offer PDF pages as PNG/JPG images (offered only when pdftoppm is installed)',
+    )
+    parser.add_argument(
         '--allow-remote',
         action='store_true',
         help='let EPUBs load images, fonts and styles from https:// sites '
@@ -2797,6 +2990,14 @@ def main():
         print(f'hosting {count} PDF file{"" if count == 1 else "s"} from {library.root}')
         PdfHandler.library = library
         PdfHandler.verbose = args.verbose
+        exe = (
+            None
+            if args.no_pdf_images or not settings.get('pdf_images', True)
+            else find_pdf_renderer()
+        )
+        PdfHandler.page_renderer = PdfPageRenderer(exe) if exe else None
+        if exe:
+            print('PDF page images (PNG / JPG) are available in the viewer (using pdftoppm)')
         PdfHandler.pdfjs = args.pdfjs != 'off'
         PdfHandler.pdfjs_mode = args.pdfjs if PdfHandler.pdfjs else 'auto'
         PdfHandler.pdfjs_latest = args.pdfjs_latest_version
