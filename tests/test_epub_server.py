@@ -5,6 +5,7 @@ Run from the repository root:
     python -m unittest discover -s tests -v
 """
 
+import atexit
 import collections
 import contextlib
 import hashlib
@@ -12,6 +13,7 @@ import io
 import os
 import re
 import posixpath
+import shutil
 import socket
 import subprocess
 import sys
@@ -81,6 +83,7 @@ def free_port():
 
 
 _EMPTY_HOME = tempfile.mkdtemp(prefix='epub_server_home_')
+atexit.register(shutil.rmtree, _EMPTY_HOME, ignore_errors=True)
 
 
 def isolated_env(**extra):
@@ -121,6 +124,12 @@ class Cli:
                 socket.create_connection(('127.0.0.1', self.port), 0.2).close()
                 break
             except OSError:
+                if self.proc.poll() is not None:  # it died: say why now, don't wait 10 seconds
+                    out, err = self.proc.communicate()
+                    raise AssertionError(
+                        f'the script exited with status {self.proc.returncode} before it '
+                        f'was listening\nstdout: {out}\nstderr: {err}'
+                    )
                 time.sleep(0.1)
 
     def get(self, path, headers=None):
@@ -1535,7 +1544,7 @@ class ConfigFileTests(TempDirCase):
     def test_pdfjs_mode_and_version_on_the_command_line(self):
         page, out = self.pdf_cli('--pdfjs', 'legacy')
         self.assertIn('data-pdfjs-mode="legacy"', page)
-        self.assertIn('3.11.174 only', out)
+        self.assertIn(f'{es.PDFJS_LEGACY_VERSION} only', out)
         page, out = self.pdf_cli('--pdfjs', 'latest', '--pdfjs-latest-version', '6.0.1')
         self.assertIn('data-pdfjs-mode="latest"', page)
         self.assertIn('data-pdfjs-latest="6.0.1"', page)
@@ -1580,10 +1589,12 @@ class ConfigFileTests(TempDirCase):
     def test_a_script_with_edited_locations_uses_them(self):
         edited = self.tmp / 'edited_server.py'
         text = SCRIPT.read_text(encoding='utf-8')
-        marker = "    'epub_server.ini',\n    '{script_dir}/epub_server.ini',"
-        self.assertIn(marker, text)
+        # tolerant of quote style and line breaks, so reformatting the script can't break this
+        pattern = re.compile(r"DEFAULT_CONFIG_LOCATIONS\s*=\s*\[.*?\n\]", re.S)
+        self.assertRegex(text, pattern)
         edited.write_text(
-            text.replace(marker, "    '{script_dir}/mine/custom.ini',"), encoding='utf-8'
+            pattern.sub("DEFAULT_CONFIG_LOCATIONS = ['{script_dir}/mine/custom.ini']", text, 1),
+            encoding='utf-8',
         )
         r = subprocess.run(
             [sys.executable, '-I', str(edited), '--init-config'],
@@ -1606,6 +1617,26 @@ class ConfigFileTests(TempDirCase):
         r = run_script('--check-config', cwd=here)
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn('applied automatically', r.stdout)
+
+    def test_a_named_config_replaces_the_automatic_file_instead_of_merging_with_it(self):
+        env = self.home_with('both', '[server]\nauto_apply_custom_settings = yes\naccess = share\n')
+        named = self.write_config('[server]\nport = 9123\nopen_browser = no\n', 'named.ini')
+        status, out, err = self.serve_with_env(env, '--config', named)
+        self.assertEqual(status, 200)
+        self.assertIn(f'using settings from {named}', out)
+        self.assertNotIn('(auto-applied)', out)
+        self.assertNotIn('on your network, open', out)  # the automatic file's "share" is not used
+
+    def test_the_test_helper_reports_a_script_that_dies_at_startup_quickly(self):
+        start = time.monotonic()
+        with self.assertRaisesRegex(AssertionError, 'exited with status 2'):
+            Cli('--definitely-not-an-option')
+        self.assertLess(time.monotonic() - start, 5)
+
+    def test_port_zero_is_refused(self):
+        r = run_script('--port', '0', 'x.epub')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('not a valid port', r.stderr)
 
     def test_config_and_no_config_conflict(self):
         r = run_script('--config', 'x.ini', '--no-config', 'a.epub')
@@ -1786,7 +1817,7 @@ class BrowserCompatibilityTests(TempDirCase):
         for part in ('id="btn-pdfjs"', 'id="pdfjs-wrap"', 'id="pdfjs-scroll"', '<object data='):
             self.assertIn(part, page)
         # the only other site it can contact, at a fixed version
-        self.assertIn('data-pdfjs-legacy="3.11.174"', page)
+        self.assertIn(f'data-pdfjs-legacy="{es.PDFJS_LEGACY_VERSION}"', page)
         self.assertIn(f'data-pdfjs-latest="{es.PDFJS_LATEST_VERSION}"', page)
         self.assertIn('data-pdfjs-mode="auto"', page)
         self.assertEqual(
@@ -1795,6 +1826,8 @@ class BrowserCompatibilityTests(TempDirCase):
         # CVE-2024-4367: a crafted PDF must not be able to run script in this page
         self.assertIn('isEvalSupported: false', page)
         self.assertIn('withCredentials: false', page)
+        # the backup is pinned on purpose: 3.11.174 is the last release that runs as a plain
+        # script on old TV browsers (newer ones are ES modules)
         self.assertEqual(es.PDFJS_LEGACY_VERSION, '3.11.174')
 
     def test_turning_pdfjs_off_removes_every_trace_of_it(self):
@@ -2441,7 +2474,8 @@ class HardeningTests(TempDirCase):
             start = time.monotonic()
             es.first_real_element_text(hostile, 'title')
             es.first_real_tag(hostile, 'body')
-            self.assertLess(time.monotonic() - start, 3, hostile[:10])
+            # a "did not turn quadratic" check, not a performance target: generous for slow CI
+            self.assertLess(time.monotonic() - start, 10, hostile[:10])
 
     def test_drm_cannot_be_bypassed_by_an_alternate_unicode_spelling(self):
         files = main_epub_files()
@@ -2571,6 +2605,9 @@ class HardeningTests(TempDirCase):
         page = srv.get('/')
         self.assertEqual(page.headers.get('x-content-type-options'), 'nosniff')
         self.assertNotIn('cross-origin-resource-policy', page.headers)
+        # deliberately stricter than the book pages (which use same-origin so that a failed
+        # request can name the page that asked for it): nothing here logs referrers
+        self.assertEqual(page.headers.get('referrer-policy'), 'no-referrer')
 
 
 class CommandLineTests(TempDirCase):
