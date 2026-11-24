@@ -151,9 +151,9 @@ open the book you want, shared the way you want.
    ```
    python3 epub_server.py --init-config
    ```
-   It is written to `~/.config/epub_server/config.ini` (on Windows,
-   `%APPDATA%\epub_server\config.ini`) and never overwrites an existing file.
-   Use `--init-config --config my.ini` to write it somewhere else.
+   It is written as `epub_server.ini` in the folder you ran the command from
+   and never overwrites an existing file. Use `--init-config --config my.ini`
+   to write it somewhere else.
 2. Edit it. For example:
    ```ini
    [server]
@@ -187,8 +187,8 @@ itself, so they have no setting.
 **Which file, and when it applies**
 
 - **Automatic file.** Without `--config`, the script looks for `epub_server.ini`
-  next to `epub_server.py`, then the per-user file above (the first one that
-  exists). It is applied only if it is valid **and** has
+  in the current folder, then next to `epub_server.py`, then the per-user file
+  above (the first one that exists). It is applied only if it is valid **and** has
   `auto_apply_custom_settings = yes`. If it is missing, it is skipped. If it is
   corrupted (bad value, unknown setting, not text...), it is skipped with a
   one-line `ignoring settings file ...` notice and the server runs on the
@@ -197,8 +197,11 @@ itself, so they have no setting.
 - **A file you name.** `--config FILE` is always applied, whether or not it
   has `auto_apply_custom_settings`, and a problem in it is an error, since you
   asked for that file specifically.
-- **Never the current folder.** The folder you run from is not searched, so a
-  stray file in a downloaded folder can't change how the server behaves.
+- **The current folder wins.** Keep an `epub_server.ini` in the folder you run
+  from and it is used. Because of that, only run the server from folders you
+  trust: a settings file someone else put in a folder (a downloaded archive,
+  say) would apply there, if it is valid and asks to be applied automatically.
+  `python3 epub_server.py --check-config` shows which file would be used.
 - `--no-config` ignores every settings file for that run.
 - **Order of priority:** command-line options, then the settings file, then the
   built-in defaults. `--share`, `--only-me` or `--host` on the command line

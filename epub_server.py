@@ -2405,12 +2405,26 @@ def user_config_path():
     return base / 'epub_server' / 'config.ini'
 
 
-def find_config_file():
-    """The config file to use when none was named: next to this script, then the per-user one.
+def config_candidates():
+    """Where an unnamed settings file is looked for, in order: the folder you run the script
+    from, then next to the script itself, then the per-user location."""
+    places = [Path(CONFIG_FILE_NAME), Path(__file__).resolve().with_name(CONFIG_FILE_NAME)]
+    places.append(user_config_path())
+    seen, found = set(), []
+    for place in places:
+        try:
+            key = place.resolve()
+        except (OSError, RuntimeError):
+            key = place
+        if key not in seen:
+            seen.add(key)
+            found.append(place)
+    return found
 
-    The current folder is deliberately NOT searched, so a folder you merely happen to be
-    standing in (a downloaded book, say) can't change how the server behaves."""
-    for candidate in (Path(__file__).resolve().with_name(CONFIG_FILE_NAME), user_config_path()):
+
+def find_config_file():
+    """The config file to use when none was named: the first of `config_candidates` that exists."""
+    for candidate in config_candidates():
         try:
             if candidate.is_file():
                 return candidate
@@ -2584,7 +2598,7 @@ def check_config(explicit):
         print(f'{explicit}: {message}')
         return 0 if ok else 1
     status = 0
-    for candidate in (Path(__file__).resolve().with_name(CONFIG_FILE_NAME), user_config_path()):
+    for candidate in config_candidates():
         ok, message = describe_config(candidate)
         print(f'{candidate}: {message}')
         status = status or (0 if ok else 1)
@@ -2681,8 +2695,8 @@ def main():
     configuration.add_argument(
         '--config',
         metavar='FILE',
-        help=f'read default settings from this file (otherwise {CONFIG_FILE_NAME} next to this '
-        'script, then the per-user config file, is used if it exists)',
+        help=f'read default settings from this file (otherwise {CONFIG_FILE_NAME} in the current '
+        'folder, then next to this script, then the per-user config file, is used if it exists)',
     )
     configuration.add_argument(
         '--no-config', action='store_true', help='ignore any settings file this time'
@@ -2690,7 +2704,7 @@ def main():
     configuration.add_argument(
         '--init-config',
         action='store_true',
-        help='write a commented settings file (to --config FILE, or the per-user location) and exit',
+        help=f'write a commented settings file (to --config FILE, or {CONFIG_FILE_NAME} in the current folder) and exit',
     )
     configuration.add_argument(
         '--check-config',
@@ -2705,7 +2719,7 @@ def main():
     if args.check_config:
         sys.exit(check_config(Path(args.config) if args.config else None))
     if args.init_config:
-        sys.exit(init_config(Path(args.config) if args.config else user_config_path()))
+        sys.exit(init_config(Path(args.config) if args.config else Path(CONFIG_FILE_NAME)))
     settings, config_file = {}, None
     if args.config and not args.no_config:
         # A file you named yourself is always applied, and a problem with it is an error.

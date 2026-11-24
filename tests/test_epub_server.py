@@ -97,7 +97,7 @@ def isolated_env(**extra):
 class Cli:
     """The script run as a real subprocess, the way a user would run it."""
 
-    def __init__(self, *args, env=None):
+    def __init__(self, *args, env=None, cwd=None):
         self.port = free_port()
         self.proc = subprocess.Popen(
             [
@@ -114,6 +114,7 @@ class Cli:
             stderr=subprocess.PIPE,
             universal_newlines=True,
             env=env or isolated_env(),
+            cwd=cwd,
         )
         for _ in range(100):
             try:
@@ -134,7 +135,7 @@ class Cli:
             return self.proc.communicate()
 
 
-def run_script(*args, env=None):
+def run_script(*args, env=None, cwd=None):
     """Run the script expecting it to exit on its own (bad input); returns the process."""
     return subprocess.run(
         [sys.executable, '-I', str(SCRIPT), *map(str, args), '--no-browser'],
@@ -143,6 +144,7 @@ def run_script(*args, env=None):
         universal_newlines=True,
         timeout=30,
         env=env or isolated_env(),
+        cwd=cwd,
     )
 
 
@@ -1410,24 +1412,38 @@ class ConfigFileTests(TempDirCase):
         self.assertIn('on your network, open', out)
         self.assertNotIn('(auto-applied)', out)
 
-    def test_a_file_in_the_current_folder_is_never_used(self):
-        stray = self.tmp / 'cwd'
-        stray.mkdir()
-        (stray / es.CONFIG_FILE_NAME).write_text(
+    def test_a_file_in_the_current_folder_is_used(self):
+        here = self.tmp / 'cwd'
+        here.mkdir()
+        (here / es.CONFIG_FILE_NAME).write_text(
             '[server]\nauto_apply_custom_settings = yes\naccess = share\n'
         )
         epub = write_epub(self.tmp / 'cwdbook.epub', main_epub_files())
-        r = subprocess.run(
-            [sys.executable, '-I', str(SCRIPT), str(epub), '--no-browser', '--help'],
-            cwd=stray,
-            env=isolated_env(),
-            stdout=subprocess.PIPE,
-            universal_newlines=True,
+        cli = Cli(
+            epub,
+            env=self.home_with('cwdhome', '[server]\nauto_apply_custom_settings = yes\n'),
+            cwd=here,
         )
-        self.assertEqual(r.returncode, 0)
-        status, out, err = self.serve_with_env(self.home_with('auto10'))
-        self.assertNotIn('using settings from', out)
-        self.assertEqual(es.user_config_path().name, 'config.ini')
+        try:
+            cli.get('/')
+        finally:
+            out, err = cli.stop()
+        self.assertIn('(auto-applied)', out)
+        self.assertIn('on your network, open', out)
+        self.assertIn(es.CONFIG_FILE_NAME, out)
+
+    def test_a_corrupted_file_in_the_current_folder_is_skipped(self):
+        here = self.tmp / 'cwdbad'
+        here.mkdir()
+        (here / es.CONFIG_FILE_NAME).write_text('[server]\nport = nine\n')
+        epub = write_epub(self.tmp / 'cwdbad.epub', main_epub_files())
+        cli = Cli(epub, env=self.home_with('cwdbadhome'), cwd=here)
+        try:
+            self.assertEqual(cli.get('/').status, 200)
+        finally:
+            out, err = cli.stop()
+        self.assertIn('ignoring settings file', err + out)
+        self.assertNotIn('(auto-applied)', out)
 
     def test_init_config_writes_a_template_once(self):
         target = self.tmp / 'new' / 'dir' / 'conf.ini'
@@ -1549,14 +1565,16 @@ class ConfigFileTests(TempDirCase):
         self.assertNotIn('cdnjs', page)
         self.assertIn('(auto-applied)', out)
 
-    def test_init_config_defaults_to_the_per_user_location(self):
-        home = self.tmp / 'home2'
-        env = isolated_env(
-            HOME=str(home), XDG_CONFIG_HOME=str(home / 'cfg'), APPDATA=str(home / 'cfg')
-        )
-        r = run_script('--init-config', env=env)
+    def test_init_config_writes_into_the_current_folder(self):
+        here = self.tmp / 'initdir'
+        here.mkdir()
+        r = run_script('--init-config', cwd=here)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue((home / 'cfg' / 'epub_server' / 'config.ini').is_file())
+        self.assertTrue((here / es.CONFIG_FILE_NAME).is_file())
+        self.assertEqual(run_script('--init-config', cwd=here).returncode, 1)
+        r = run_script('--check-config', cwd=here)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('applied automatically', r.stdout)
 
     def test_config_and_no_config_conflict(self):
         r = run_script('--config', 'x.ini', '--no-config', 'a.epub')
