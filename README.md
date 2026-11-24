@@ -197,7 +197,13 @@ itself, so they have no setting.
 - **A file you name.** `--config FILE` is always applied, whether or not it
   has `auto_apply_custom_settings`, and a problem in it is an error, since you
   asked for that file specifically.
-- **The current folder wins.** Keep an `epub_server.ini` in the folder you run
+- **You choose where it is looked for.** Near the top of the settings section
+  of `epub_server.py` is a list, `DEFAULT_CONFIG_LOCATIONS`. Edit it to change
+  where the file is loaded from; `--init-config` writes to its first entry.
+  The default is `epub_server.ini` in the current folder, then next to the
+  script, then the per-user folder (`~`, `{script_dir}` and `{user_config}`
+  work in entries; a relative path means the folder you run from).
+- **The current folder wins by default.** Keep an `epub_server.ini` in the folder you run
   from and it is used. Because of that, only run the server from folders you
   trust: a settings file someone else put in a folder (a downloaded archive,
   say) would apply there, if it is valid and asks to be applied automatically.

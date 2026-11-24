@@ -1565,6 +1565,37 @@ class ConfigFileTests(TempDirCase):
         self.assertNotIn('cdnjs', page)
         self.assertIn('(auto-applied)', out)
 
+    def test_the_default_locations_are_an_editable_list_in_the_script(self):
+        self.assertIsInstance(es.DEFAULT_CONFIG_LOCATIONS, list)
+        found = es.config_candidates(
+            ['mine.ini', '{script_dir}/a.ini', '{user_config}/x/b.ini', '~/c.ini', 'mine.ini']
+        )
+        self.assertEqual(found[0], Path('mine.ini'))
+        self.assertEqual(found[1], Path(es.__file__).resolve().parent / 'a.ini')
+        self.assertEqual(found[2], es.user_config_dir() / 'x' / 'b.ini')
+        self.assertEqual(found[3], Path.home() / 'c.ini')
+        self.assertEqual(len(found), 4)  # duplicates dropped
+        self.assertEqual(es.config_candidates([]), [])
+
+    def test_a_script_with_edited_locations_uses_them(self):
+        edited = self.tmp / 'edited_server.py'
+        text = SCRIPT.read_text(encoding='utf-8')
+        marker = "    'epub_server.ini',\n    '{script_dir}/epub_server.ini',"
+        self.assertIn(marker, text)
+        edited.write_text(
+            text.replace(marker, "    '{script_dir}/mine/custom.ini',"), encoding='utf-8'
+        )
+        r = subprocess.run(
+            [sys.executable, '-I', str(edited), '--init-config'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            env=isolated_env(),
+            cwd=self.tmp,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.tmp / 'mine' / 'custom.ini').is_file())
+
     def test_init_config_writes_into_the_current_folder(self):
         here = self.tmp / 'initdir'
         here.mkdir()
