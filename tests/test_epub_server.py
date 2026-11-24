@@ -370,6 +370,17 @@ class SmallHelperTests(unittest.TestCase):
     def test_numeric_entities_leave_comments_and_xml_entities(self):
         out = es.numeric_entities('a&nbsp;b &amp; c<!-- &nbsp; --><![CDATA[&nbsp;]]>&eacute;')
         self.assertEqual(out, 'a&#160;b &amp; c<!-- &nbsp; --><![CDATA[&nbsp;]]>&#233;')
+        # Script/style blocks are also left alone so code samples keep literal "&nbsp;".
+        scripted = (
+            'x&nbsp;y<script>var s = "&nbsp;";</script>z&eacute;'
+            '<style>.x { content: "&mdash;"; }</style>'
+        )
+        out2 = es.numeric_entities(scripted)
+        self.assertEqual(
+            out2,
+            'x&#160;y<script>var s = "&nbsp;";</script>z&#233;'
+            '<style>.x { content: "&mdash;"; }</style>',
+        )
 
     def test_wellformed_xhtml(self):
         good = '<html xmlns="http://www.w3.org/1999/xhtml"><body/></html>'
@@ -965,6 +976,12 @@ class LazyTitleTests(TempDirCase):
         self.assertEqual(book.title_for('OEBPS/c2.xhtml', '<h1>Given</h1>'), 'Given')
         self.assertEqual(len(source.reads), before)
 
+    def test_title_for_collapses_internal_whitespace(self):
+        path = write_epub(self.tmp / 'lazy-ws.epub', main_epub_files())
+        book, _ = load_book(path)
+        multiline = '<html><head><title>  Line\none\t  two  </title></head><body/></html>'
+        self.assertEqual(book.title_for('OEBPS/c1.xhtml', multiline), 'Line one two')
+
     def test_unreadable_chapters_fall_back_to_the_file_name(self):
         path = write_epub(self.tmp / 'lazy3.epub', main_epub_files())
         book, _ = load_book(path)
@@ -1201,6 +1218,21 @@ class ConfigFileTests(TempDirCase):
     def test_empty_file_or_only_comments_change_nothing(self):
         self.assertEqual(es.read_config(self.write_config('')), {})
         self.assertEqual(es.read_config(self.write_config('# nothing here\n[server]\n')), {})
+
+    def test_inline_hash_and_semicolon_comments_are_accepted(self):
+        # Matches the README example style (inline "; ...") and the more common "# ...".
+        found = es.read_config(
+            self.write_config(
+                '[server]\n'
+                'auto_apply_custom_settings = yes   ; apply this file automatically\n'
+                'access = share                     # or: only-me\n'
+                'port = 9000\n'
+            )
+        )
+        self.assertEqual(
+            found,
+            {'auto_apply_custom_settings': True, 'access': 'share', 'port': 9000},
+        )
 
     def test_the_generated_template_is_valid_and_only_turns_on_auto_apply(self):
         found = es.read_config(self.write_config(es.CONFIG_TEMPLATE))
@@ -1965,6 +1997,7 @@ class CompatibilityTests(TempDirCase):
             [
                 sys.executable,
                 '-I',
+                '-u',  # unbuffered, same as Cli; otherwise the "serving at" line stays buffered
                 str(SCRIPT),
                 str(epub),
                 '--host',
@@ -2499,6 +2532,19 @@ class HardeningTests(TempDirCase):
         book, _ = load_book(write_epub(self.tmp / 'nfd2.epub', files))
         for form in ('NFC', 'NFD'):
             self.assertTrue(book.is_drm(unicodedata.normalize(form, 'OEBPS/café2.xhtml')), form)
+
+    def test_drm_uri_with_leading_slash_still_matches(self):
+        # Some encryption.xml files use root-absolute URIs ("/OEBPS/..."); those must
+        # still match the package-relative paths used for requests.
+        files = main_epub_files()
+        enc = files['META-INF/encryption.xml'].decode()
+        files['META-INF/encryption.xml'] = enc.replace(
+            'URI="OEBPS/drm.xhtml"', 'URI="/OEBPS/drm.xhtml"'
+        ).encode()
+        book, _ = load_book(write_epub(self.tmp / 'slashdrm.epub', files))
+        self.assertTrue(book.is_drm('OEBPS/drm.xhtml'))
+        self.assertIn('OEBPS/drm.xhtml', book.drm_paths)
+        self.assertNotIn('/OEBPS/drm.xhtml', book.drm_paths)
 
     def test_entity_declarations_in_xml_are_refused(self):
         bomb = b'<?xml version="1.0"?><!DOCTYPE a [<!ENTITY x "y">]><a>&x;</a>'
